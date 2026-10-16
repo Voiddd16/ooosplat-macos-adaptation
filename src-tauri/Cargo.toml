@@ -12,6 +12,8 @@ default-run = "ooo-splat"
 [features]
 default = []
 local-colmap = []
+# 自研 SfM 后端（Apple 平台）。见 docs/project-notes/ooo-sfm-implementation-plan.md
+ooo-sfm = ["dep:rayon", "dep:nalgebra"]
 
 [lib]
 name = "ooo_splat"
@@ -57,6 +59,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 trash = "5.2"
 uuid = { version = "1", features = ["serde", "v4"] }
+# 仅 ooo-sfm 需要：特征提取按图像并行（对应 COLMAP 侧的 OpenMP）。
+rayon = { version = "1", optional = true }
+# 仅 ooo-sfm 需要：M4 起的小规模稠密线性代数（SVD / QR / 特征值），
+# 对应 COLMAP 侧的 Eigen。默认特性即可（std + 常用分解）。
+nalgebra = { version = "0.34", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -3404,6 +3404,35 @@ impl PipelineRunner {
                     }
                 }
             }
+            ProcessUpdate::StageProgress {
+                phase,
+                current,
+                total,
+                message,
+            } => {
+                {
+                    let mut tracker = runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    tracker.snapshot.phase = phase.into();
+                    events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                }
+                let progress = total
+                    .filter(|value| *value > 0)
+                    .map(|value| current as f32 / value as f32);
+                events.send(
+                    stage,
+                    Some(engine),
+                    EventKind::Progress,
+                    EventLevel::Info,
+                    progress,
+                    progress.is_none(),
+                    message,
+                    Some(current),
+                    total,
+                    None,
+                );
+            }
             ProcessUpdate::Line { stream: _, line } => {
                 if line.is_empty() {
                     return;

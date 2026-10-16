@@ -215,6 +215,15 @@ pub enum ProcessUpdate {
         elapsed_ms: u64,
     },
     Resources(resources::ProcessResources),
+    /// 进程内后端（ooo-sfm）直接上报的结构化进度，不经文本解析。
+    /// 子进程后端仍走 `Line` 解析；该变体只由 `engines::colmap` 的自研实现产生。
+    StageProgress {
+        /// 阶段内的子相位（供 `RuntimeSnapshot.phase`；未知值前端回退到"运行中"）
+        phase: &'static str,
+        current: u64,
+        total: Option<u64>,
+        message: String,
+    },
 }
 
 pub type ProcessObserver = Arc<dyn Fn(ProcessUpdate) + Send + Sync>;
@@ -277,6 +286,12 @@ impl ProcessManager {
 
     pub fn child_token(&self) -> CancellationToken {
         self.cancellation.child_token()
+    }
+
+    /// 进程内后端（ooo-sfm）在进程内执行阶段时，需要复用同一套生命周期事件
+    /// （`LogOpened` / `Exited`），否则日志查看器与 `RunnerUpdate` 会静默失效。
+    pub fn lifecycle_observer(&self) -> Option<ProcessObserver> {
+        self.lifecycle.clone()
     }
 
     pub async fn run(&self, spec: ProcessSpec) -> Result<ProcessOutput> {
