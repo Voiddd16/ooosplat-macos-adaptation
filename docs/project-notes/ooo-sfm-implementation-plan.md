@@ -465,11 +465,34 @@ BA 在本 fork 内按平台重写（D4）：macOS = CPU BA，`select` / `select_
   8 点精化代价下降、退化对、随机匹配不通过、平面 → H、4 点共线拒绝、已知 H 的最小/多点
   恢复、F 极线残差），全套 `cargo test --lib --features ooo-sfm` 346+ 全绿。
 
-### M5 — 稀疏重建（`mapper` 等价）
-- [ ] `map` / `map_from_existing` / `map_incremental`。
-- [ ] 输出 `sparse/<n>/{cameras,images,points3D}.bin`（+ 可选 rigs/frames 成对）。
-- [ ] 注册率语义与 `validator.rs` 对齐。
-- [ ] `allow_two_view_tracks` 语义等价。
+### M5 — 稀疏重建（`mapper` 等价）——本次已侦察完毕（`recon/m5-mapper.md`）
+- [ ] M5a `apple/reconstruction.rs`：Reconstruction 状态 + CorrespondenceGraph
+      （DB matches → 转置索引）+ ObservationManager（visibility pyramid 6 级、
+      `Point3DVisibilityScore` 即 pyramid score，MIN_UNCERTAINTY 排序用）。
+- [ ] M5b `apple/pose.rs`：PnP 栈——P4PF（估焦距，RANSAC）/ P3P + EPnP
+      （LO-RANSAC，`CamRayFromImg` 光线）/ `RefineAbsolutePose`（Cauchy b=1、
+      100 iters、主点恒定；用 M6 的 BA 引擎以"单图位姿可变 + 点常量"模式实现）。
+- [ ] M5c 三角化器 + 观测过滤：Create/Continue/Merge/Complete/Retriangulate
+      （DLT 2 视图 SVD + 多视图垂距特征向量；角误差 RANSAC，≤15 观测穷举采样）。
+- [ ] M5d `apple/mapper.rs`：初始化对（每对只试一次、`init_num_trials=200`、
+      松弛 2 轮：inliers 100→50→25、tri_angle 16→8→4）→ 注册循环
+      （`FindNextImages` 两桶 + `max_reg_trials=3`）→ 局部 BA
+      （SOFT_L1 b=1.0、25 iters、gauge=THREE_POINTS、`ba_local_num_images=6`、
+      迭代 2 轮 + changed<0.001）→ 全局 BA 触发（1.1×frames/points、500/250000）
+      （TRIVIAL、50 iters、gauge=TWO_CAMS、<10 帧时容差 /10 迭代 ×2）→
+      `Normalize`（extent 10，percentile 0.1/0.9 取相机中心）→ `UpdatePoint3DErrors`。
+- [ ] M5e 三个入口接线（`apple/mod.rs`）：
+  - `map`：全新重建；`refine_focal/extra=true`；`allow_two_view_tracks=true` ⇔
+    `tri_ignore_two_view_tracks=false`（已核对 `colmap.rs::mapper_args`）。
+  - `map_from_existing`（Bridge 补帧）：`--input_path` + `multiple_models=0`；
+    **不**设 `fix_existing_frames`；内参精化保持默认 true。
+  - `map_incremental`（补拍续建）：`image_list_path` + **`fix_existing_frames=1`**
+    + **内参精化全关**（focal/pp/extra=0）。
+- [ ] 输出 `sparse/<n>/{cameras,images,points3D}.bin`（M2 写入器；`extract_colors`：
+      颜色为黑时按 `(x−0.5, y−0.5)` 双线性采样，`image` crate 读 RGB）。
+- [ ] 注册率语义与 `validator.rs` 对齐（`best_sparse_model*` 读产物计数）。
+- 验收：合成场景（M6 的 `synthetic_scene` 思路）跑通 init→register→triangulate→BA
+      全循环；`sparse/*.bin` 用 `reconstruction/colmap_model.rs` 读回校验。
 
 ### M6 — BA（必做，按平台）✅
 - [x] 实现 **CPU BA**（`ooo_sfm/apple/ba.rs`）：Schur 消元（点块）+ LM（Marquardt 阻尼），
