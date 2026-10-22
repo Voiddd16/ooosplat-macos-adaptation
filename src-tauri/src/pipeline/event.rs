@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::engines::ColmapAccelerationStatus;
+use crate::engines::AccelerationStatus;
 
 use super::{progress::stage_progress_range, PipelineStage};
 
@@ -26,11 +26,11 @@ pub enum EventLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum PipelineEngine {
+pub enum PipelineComponent {
     System,
-    Ffmpeg,
-    Colmap,
-    Brush,
+    Media,
+    Reconstruction,
+    Training,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ pub struct PipelineEvent {
     pub kind: EventKind,
     pub level: EventLevel,
     pub stage: PipelineStage,
-    pub engine: Option<PipelineEngine>,
+    pub component: Option<PipelineComponent>,
     pub progress: f32,
     pub stage_progress: Option<f32>,
     pub indeterminate: bool,
@@ -56,7 +56,7 @@ pub struct PipelineEvent {
     pub total: Option<u64>,
     pub unit: Option<String>,
     pub elapsed_ms: u64,
-    pub acceleration: Option<ColmapAccelerationStatus>,
+    pub acceleration: Option<AccelerationStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<super::runtime::RuntimeSnapshot>,
 }
@@ -74,7 +74,7 @@ impl PipelineEvent {
             kind: EventKind::Stage,
             level: EventLevel::Info,
             stage,
-            engine: Some(PipelineEngine::System),
+            component: Some(PipelineComponent::System),
             progress: start + (end - start) * bounded,
             stage_progress: Some(bounded * 100.0),
             indeterminate: false,

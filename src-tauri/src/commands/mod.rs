@@ -10,13 +10,13 @@ use uuid::Uuid;
 pub mod html_export;
 
 use crate::{
+    contracts::{AccelerationStatus, ComponentStatus, FailureKind},
     engines::{
         ffprobe::probe_video,
         health::{
-            check_colmap_acceleration as refresh_colmap_acceleration,
-            check_colmap_acceleration_cached as detect_colmap_acceleration,
+            detect_acceleration, refresh_acceleration,
         },
-        ColmapAccelerationStatus, EnginePaths, EngineStatus,
+        EnginePaths,
     },
     error::{Result, SplatError},
     pipeline::{
@@ -28,7 +28,7 @@ use crate::{
             PipelineFailureContext, PipelineResult, PipelineRunner, ReshootInputInfo,
             ReshootInputType, ReshootSourceInfo,
         },
-        PipelineEngine, PipelineStage,
+        PipelineComponent, PipelineStage,
     },
     presets::{
         resolve_brush_training_preset, resolve_brush_training_preset_for_plan,
@@ -66,7 +66,7 @@ pub struct PipelineCommandError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failed_stage: Option<PipelineStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) engine: Option<PipelineEngine>,
+    pub(crate) component: Option<PipelineComponent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failure_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,7 +89,7 @@ impl From<SplatError> for PipelineCommandError {
             },
             message: error.to_string(),
             failed_stage: None,
-            engine: None,
+            component: None,
             failure_kind: None,
             project_id: None,
             project_path: None,
@@ -109,7 +109,7 @@ impl PipelineCommandError {
             project_path,
             logs_directory,
         } = runner.failure_context();
-        let (engine, failure_kind) = classify_pipeline_failure(failed_stage, &message);
+        let (component, failure_kind) = classify_pipeline_failure(failed_stage, &message);
         Self {
             code: if cancelled {
                 "cancelled"
@@ -118,8 +118,12 @@ impl PipelineCommandError {
             },
             message,
             failed_stage,
-            engine,
-            failure_kind: if cancelled { None } else { failure_kind },
+            component,
+            failure_kind: if cancelled {
+                None
+            } else {
+                failure_kind.map(|kind| kind.label())
+            },
             project_id: project_id.map(|value| value.to_string()),
             project_path: project_path.map(Box::new),
             logs_directory: logs_directory.map(Box::new),
@@ -131,7 +135,7 @@ impl PipelineCommandError {
 fn classify_pipeline_failure(
     stage: Option<PipelineStage>,
     message: &str,
-) -> (Option<PipelineEngine>, Option<&'static str>) {
+) -> (Option<PipelineComponent>, Option<FailureKind>) {
     let lower = message.to_ascii_lowercase();
     match stage {
         Some(PipelineStage::Reconstructing | PipelineStage::ValidatingReconstruction) => {
@@ -188,13 +192,11 @@ fn classify_pipeline_failure(
                 .iter()
                 .any(|needle| lower.contains(needle));
             (
-                Some(PipelineEngine::Colmap),
-                Some(if source_error {
-                    "mapper_source"
-                } else if storage_error {
-                    "mapper_storage"
+                Some(PipelineComponent::Reconstruction),
+                Some(if storage_error {
+                    FailureKind::ReconstructionStorage
                 } else {
-                    "mapper_source"
+                    FailureKind::ReconstructionInput
                 }),
             )
         }
@@ -222,23 +224,23 @@ fn classify_pipeline_failure(
             .iter()
             .any(|needle| lower.contains(needle));
             (
-                Some(PipelineEngine::Brush),
+                Some(PipelineComponent::Training),
                 Some(if device_lost {
-                    "brush_device_lost"
+                    FailureKind::TrainingDeviceLost
                 } else if dataset_error {
-                    "brush_dataset"
+                    FailureKind::TrainingDataset
                 } else {
-                    "brush_gpu"
+                    FailureKind::TrainingAccelerator
                 }),
             )
         }
         Some(PipelineStage::ProbingVideo | PipelineStage::ExtractingFrames) => {
-            (Some(PipelineEngine::Ffmpeg), None)
+            (Some(PipelineComponent::Media), None)
         }
         Some(PipelineStage::ExtractingFeatures | PipelineStage::Matching) => {
-            (Some(PipelineEngine::Colmap), None)
+            (Some(PipelineComponent::Reconstruction), None)
         }
-        _ => (Some(PipelineEngine::System), None),
+        _ => (Some(PipelineComponent::System), None),
     }
 }
 
@@ -280,6 +282,26 @@ async fn classify_dropped_input_path(path: &Path) -> Result<DroppedInputInfo> {
     }
 }
 
+/// 构造媒体工具（编译期选定的实现）。
+fn media_tool(paths: &crate::engines::EnginePaths) -> std::sync::Arc<dyn crate::media::MediaTool> {
+    crate::media::active(crate::media::MediaConfig {
+        ffmpeg: Some(paths.ffmpeg.clone()),
+        ffprobe: Some(paths.ffprobe.clone()),
+    })
+}
+
+/// 媒体作业环境。
+fn media_context(
+    process_manager: &ProcessManager,
+    observer: Option<crate::process::ProcessObserver>,
+) -> crate::media::MediaContext<'_> {
+    crate::media::MediaContext {
+        process_manager,
+        observer,
+        log_path: None,
+    }
+}
+
 #[tauri::command]
 pub async fn classify_dropped_input(path: String) -> Result<DroppedInputInfo> {
     classify_dropped_input_path(Path::new(&path)).await
@@ -305,7 +327,7 @@ pub struct AppRuntimeStatus {
     pipeline_run_elapsed_ms: u64,
     pipeline_elapsed_offset_ms: u64,
     preview_project_id: Option<String>,
-    task_acceleration: Option<ColmapAccelerationStatus>,
+    acceleration: Option<AccelerationStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -465,13 +487,17 @@ pub(crate) fn paths_for_app(app: &tauri::AppHandle) -> EnginePaths {
 }
 
 #[tauri::command]
-pub async fn check_engines(app: tauri::AppHandle) -> Vec<EngineStatus> {
+/// 组件就绪状态（媒体 / 重建 / 训练）。
+///
+/// 命令名是**中性**的：前端不需要知道背后是 COLMAP 还是自研后端。
+pub async fn check_components(app: tauri::AppHandle) -> Vec<ComponentStatus> {
     paths_for_app(&app).check_all().await
 }
 
 #[tauri::command]
-pub async fn check_colmap_acceleration(app: tauri::AppHandle) -> ColmapAccelerationStatus {
-    refresh_colmap_acceleration(&paths_for_app(&app)).await
+/// 当前加速状态（与后端无关的中性结构）。
+pub async fn get_acceleration(app: tauri::AppHandle) -> AccelerationStatus {
+    refresh_acceleration(&paths_for_app(&app)).await
 }
 
 #[tauri::command]
@@ -493,7 +519,7 @@ pub async fn probe_and_plan(
         .await
         .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
         let plan = create_image_plan(&image_sequence, &quality.preset());
-        let acceleration = detect_colmap_acceleration(&engine_paths).await;
+        let acceleration = detect_acceleration(&engine_paths).await;
         let resolution = planner_enabled.then(|| {
             resolve_planner_resolution_plan(
                 quality,
@@ -544,13 +570,15 @@ pub async fn probe_and_plan(
         })
     } else {
         let video =
-            probe_video(&engine_paths.ffprobe, &input, None, &ProcessManager::new()).await?;
+            media_tool(&engine_paths)
+                .probe_video(&media_context(&ProcessManager::new(), None), &input)
+                .await?;
         let plan = if planner_enabled {
             QualityV2FrameSelection.create_plan(&video, &quality.preset())
         } else {
             UniformRatioFrameSelection.create_plan(&video, &quality.preset())
         };
-        let acceleration = detect_colmap_acceleration(&engine_paths).await;
+        let acceleration = detect_acceleration(&engine_paths).await;
         let (source_width, source_height) = if video.rotation.rem_euclid(180) == 90 {
             (video.height, video.width)
         } else {
@@ -677,7 +705,7 @@ pub async fn estimate_project_runtime(
         ..FramePlan::default()
     });
     let samples = catalog::runtime_samples().await;
-    let acceleration = detect_colmap_acceleration(&paths_for_app(&app)).await;
+    let acceleration = detect_acceleration(&paths_for_app(&app)).await;
     let detected_total_memory_mb = acceleration.planning_gpu_total_memory_mb();
     let mut estimate = match metadata.input_type {
         ProjectInputType::Video => {
@@ -999,7 +1027,7 @@ async fn wait_task_result(
             },
             message: error.message,
             failed_stage: error.failed_stage,
-            engine: error.engine,
+            component: error.component,
             failure_kind: None,
             project_id: task.project_id.map(|v| v.to_string()),
             project_path: task.project_path.map(Box::new),
@@ -1191,7 +1219,7 @@ pub async fn get_app_runtime_status(
         .as_ref()
         .map(|runner| runner.elapsed_offset_ms())
         .unwrap_or(0);
-    let task_acceleration = active_pipeline
+    let acceleration = active_pipeline
         .as_ref()
         .and_then(|runner| runner.current_acceleration());
     drop(active_pipeline);
@@ -1212,7 +1240,7 @@ pub async fn get_app_runtime_status(
         pipeline_run_elapsed_ms,
         pipeline_elapsed_offset_ms,
         preview_project_id,
-        task_acceleration,
+        acceleration,
     })
 }
 
@@ -1950,7 +1978,8 @@ mod tests {
         PipelineCommandError, VideoOrientation,
     };
     use crate::error::SplatError;
-    use crate::pipeline::{PipelineEngine, PipelineStage};
+    use crate::pipeline::{PipelineComponent, PipelineStage};
+    use crate::contracts::FailureKind;
     use crate::presets::Quality;
     use crate::project::{PipelineStateFile, ProjectStatus};
     use std::{fs, path::Path};
@@ -2065,15 +2094,15 @@ mod tests {
         assert!(failed.failure_id.is_some());
         assert_eq!(failed.code, "pipeline_failed");
         for (stage, engine) in [
-            (PipelineStage::ProbingVideo, PipelineEngine::Ffmpeg),
-            (PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg),
-            (PipelineStage::ExtractingFeatures, PipelineEngine::Colmap),
-            (PipelineStage::Matching, PipelineEngine::Colmap),
+            (PipelineStage::ProbingVideo, PipelineComponent::Media),
+            (PipelineStage::ExtractingFrames, PipelineComponent::Media),
+            (PipelineStage::ExtractingFeatures, PipelineComponent::Reconstruction),
+            (PipelineStage::Matching, PipelineComponent::Reconstruction),
             (
                 PipelineStage::ValidatingReconstruction,
-                PipelineEngine::Colmap,
+                PipelineComponent::Reconstruction,
             ),
-            (PipelineStage::Exporting, PipelineEngine::System),
+            (PipelineStage::Exporting, PipelineComponent::System),
         ] {
             assert_eq!(
                 classify_pipeline_failure(Some(stage), "failure").0,
@@ -2089,21 +2118,21 @@ mod tests {
                 Some(PipelineStage::Reconstructing),
                 "Could not find a good initial image pair",
             ),
-            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+            (Some(PipelineComponent::Reconstruction), Some(FailureKind::ReconstructionInput)),
         );
         assert_eq!(
             classify_pipeline_failure(
                 Some(PipelineStage::TrainingSplats),
                 "IO error while loading dataset: early eof",
             ),
-            (Some(PipelineEngine::Brush), Some("brush_dataset")),
+            (Some(PipelineComponent::Training), Some(FailureKind::TrainingDataset)),
         );
         assert_eq!(
             classify_pipeline_failure(
                 Some(PipelineStage::TrainingSplats),
                 "Device lost while allocating a buffer",
             ),
-            (Some(PipelineEngine::Brush), Some("brush_device_lost")),
+            (Some(PipelineComponent::Training), Some(FailureKind::TrainingDeviceLost)),
         );
 
         let real_mapper_log = r#"
@@ -2117,42 +2146,42 @@ mod tests {
         "#;
         assert_eq!(
             classify_pipeline_failure(Some(PipelineStage::Reconstructing), real_mapper_log),
-            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+            (Some(PipelineComponent::Reconstruction), Some(FailureKind::ReconstructionInput)),
         );
         assert_eq!(
             classify_pipeline_failure(
                 Some(PipelineStage::Reconstructing),
                 "SQLite error: database is locked",
             ),
-            (Some(PipelineEngine::Colmap), Some("mapper_storage")),
+            (Some(PipelineComponent::Reconstruction), Some(FailureKind::ReconstructionStorage)),
         );
         assert_eq!(
             classify_pipeline_failure(
                 Some(PipelineStage::Reconstructing),
                 "COLMAP did not produce a usable sparse model: file not found",
             ),
-            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+            (Some(PipelineComponent::Reconstruction), Some(FailureKind::ReconstructionInput)),
         );
         assert_eq!(
             classify_pipeline_failure(
                 Some(PipelineStage::ValidatingReconstruction),
                 "稀疏重建没有可用的注册图像或三维点",
             ),
-            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+            (Some(PipelineComponent::Reconstruction), Some(FailureKind::ReconstructionInput)),
         );
         assert_eq!(
             classify_pipeline_failure(
                 Some(PipelineStage::Reconstructing),
                 "I/O error while reading feature descriptors",
             ),
-            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+            (Some(PipelineComponent::Reconstruction), Some(FailureKind::ReconstructionInput)),
         );
         assert_eq!(
             classify_pipeline_failure(
                 Some(PipelineStage::Reconstructing),
                 "I/O error while opening SQLite database",
             ),
-            (Some(PipelineEngine::Colmap), Some("mapper_storage")),
+            (Some(PipelineComponent::Reconstruction), Some(FailureKind::ReconstructionStorage)),
         );
     }
 

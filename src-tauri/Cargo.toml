@@ -12,8 +12,21 @@ default-run = "ooo-splat"
 [features]
 default = []
 local-colmap = []
-# 自研 SfM 后端（Apple 平台）。见 docs/project-notes/ooo-sfm-implementation-plan.md
-ooo-sfm = ["dep:rayon", "dep:nalgebra"]
+# ── 计算后端选择（编译期）────────────────────────────────────────────────
+# 默认（不开任何 backend feature）= 外部 COLMAP CLI，与主分支行为完全一致。
+backend-colmap = []
+# 自研 SfM 后端（进程内，Apple 平台）。见 docs/project-notes/ooo-sfm-implementation-plan.md
+backend-ooo-sfm = ["dep:rayon", "dep:nalgebra"]
+# 媒体实现（视频探测 + 抽帧）。默认 = 外部 ffmpeg/ffprobe 进程（与主分支一致）。
+media-ffmpeg-cli = []
+# 进程内 FFmpeg 库实现（rsmpeg）。要求本机 FFmpeg 与 rsmpeg 的预置绑定同 ABI
+# （rsmpeg 0.18 ↔ FFmpeg 8.x；macOS 上用 `brew install ffmpeg@8` 并设置
+# PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg@8/lib/pkgconfig）。
+# 版本不匹配会在 build.rs 里编译期报错。
+media-rsmpeg = ["dep:rsmpeg", "dep:rusty_ffmpeg", "dep:png"]
+# Metal GPU 加速（仅 macOS 生效）。默认关闭：CPU 是回退路径，运行期拿不到
+# Metal 设备也自动回退。用来控制「是否启用 metalgpu」。
+backend-ooo-sfm-metal = ["backend-ooo-sfm", "dep:metal"]
 
 [lib]
 name = "ooo_splat"
@@ -61,6 +74,12 @@ trash = "5.2"
 uuid = { version = "1", features = ["serde", "v4"] }
 # 仅 ooo-sfm 需要：特征提取按图像并行（对应 COLMAP 侧的 OpenMP）。
 rayon = { version = "1", optional = true }
+# 媒体实现：FFmpeg 库（rsmpeg）+ 预置 ABI 绑定的 FFI 层 + 纯 Rust PNG 编码。
+rsmpeg = { version = "0.18", optional = true }
+rusty_ffmpeg = { version = "0.16.7", optional = true, features = ["link_system_ffmpeg"] }
+png = { version = "0.18", optional = true }
+async-trait = "0.1"
+metal = { version = "0.32", optional = true }
 # 仅 ooo-sfm 需要：M4 起的小规模稠密线性代数（SVD / QR / 特征值），
 # 对应 COLMAP 侧的 Eigen。默认特性即可（std + 常用分解）。
 nalgebra = { version = "0.34", optional = true }

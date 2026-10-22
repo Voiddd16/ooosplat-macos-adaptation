@@ -5,140 +5,61 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{
     engines::colmap::{detect_cli_family, ColmapCliFamily},
     process::{ProcessManager, ProcessSpec},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EngineKind {
+// 契约类型（前端可见，中性命名）统一放在 `crate::contracts`。
+pub use crate::contracts::{
+    AcceleratorDevice, AcceleratorRequirements, AccelerationMode, AccelerationReason,
+    AccelerationState, AccelerationStatus, ComponentKind, ComponentStatus,
+};
+
+/// 被探测的**工具**（内部细节，不进 IPC）。
+///
+/// 刻意保留"具体工具"粒度：ffmpeg 与 ffprobe 要分别探测，COLMAP 还要探测它的
+/// 6 个子命令。聚合成前端可见的 [`ComponentKind`] 在 `component_status()` 里做。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
     Ffmpeg,
     Ffprobe,
-    Colmap,
-    Brush,
+    Reconstruction,
+    Training,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EngineStatus {
-    pub kind: EngineKind,
+/// 单个工具的探测结果（内部）。
+#[derive(Debug, Clone)]
+pub struct ToolStatus {
+    pub kind: ToolKind,
     pub path: PathBuf,
     pub exists: bool,
     pub can_start: bool,
     pub version: Option<String>,
     pub cpu_only: Option<bool>,
-    pub acceleration: Option<ColmapAccelerationStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub colmap_cli_family: Option<ColmapCliFamily>,
+    pub acceleration: Option<AccelerationStatus>,
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ColmapBackend {
-    Cpu,
-    Gpu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum GpuDetectionState {
-    Ready,
-    TemporarilyUnavailable,
-    Unavailable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AccelerationReasonCode {
-    GpuReady,
-    MacOsCpuOnly,
-    ColmapUnavailable,
-    ColmapCudaUnavailable,
-    RequirementsUnavailable,
-    NvidiaSmiNotFound,
-    ProbeFailed,
-    ProbeTimeout,
-    NoNvidiaGpu,
-    DriverVersionUnknown,
-    DriverTooOld,
-    ComputeCapabilityUnknown,
-    ComputeCapabilityTooLow,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GpuDeviceInfo {
-    pub index: u32,
-    pub name: String,
-    pub driver_version: String,
-    pub compute_capability: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_memory_mb: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccelerationRequirements {
-    pub minimum_driver_version: String,
-    pub minimum_compute_capability: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ColmapAccelerationStatus {
-    pub backend: ColmapBackend,
-    pub detection_state: GpuDetectionState,
-    pub reason_code: AccelerationReasonCode,
-    pub reason: String,
-    pub device: Option<GpuDeviceInfo>,
-    pub requirements: AccelerationRequirements,
-    #[serde(default)]
-    pub detected_nvidia_device_count: usize,
-}
-
-impl ColmapAccelerationStatus {
-    pub const fn use_gpu(&self) -> bool {
-        matches!(self.backend, ColmapBackend::Gpu)
-    }
-
-    /// Returns total VRAM only for a GPU that passed the existing NVIDIA
-    /// compatibility checks. CPU fallbacks may still retain diagnostic device
-    /// information, but must not opt Brush into a higher-memory profile.
-    pub fn usable_gpu_total_memory_mb(&self) -> Option<u64> {
-        self.use_gpu()
-            .then(|| {
-                self.device
-                    .as_ref()
-                    .and_then(|device| device.total_memory_mb)
-            })
-            .flatten()
-    }
-
-    /// Planning may keep using a recent, successful session probe while a
-    /// background refresh is temporarily unavailable. Task execution never
-    /// calls this fallback path and always performs a fresh probe.
-    pub fn planning_gpu_total_memory_mb(&self) -> Option<u64> {
-        (self.use_gpu()
-            && matches!(
-                self.detection_state,
-                GpuDetectionState::Ready | GpuDetectionState::TemporarilyUnavailable
-            ))
-        .then(|| {
-            self.device
-                .as_ref()
-                .and_then(|device| device.total_memory_mb)
-        })
-        .flatten()
-    }
-
-    pub fn gpu_index(&self) -> Option<u32> {
-        self.use_gpu()
-            .then(|| self.device.as_ref().map(|device| device.index))
-            .flatten()
+impl ToolStatus {
+    /// 聚合成前端可见的组件状态。
+    ///
+    /// 丢弃的字段（`version` / `cpu_only` / `colmap_cli_family`）前端从不消费，
+    /// 而它们都是实现专属概念 —— 不出 IPC 边界。
+    pub fn component_status(&self) -> ComponentStatus {
+        ComponentStatus {
+            kind: match self.kind {
+                ToolKind::Ffmpeg | ToolKind::Ffprobe => ComponentKind::Media,
+                ToolKind::Reconstruction => ComponentKind::Reconstruction,
+                ToolKind::Training => ComponentKind::Training,
+            },
+            ready: self.exists && self.can_start,
+            acceleration: self.acceleration.clone(),
+            detail: self.detail.clone(),
+            location: Some(self.path.display().to_string()),
+        }
     }
 }
 
@@ -164,7 +85,7 @@ pub struct AccelerationProbeService {
 
 #[derive(Default)]
 struct AccelerationProbeState {
-    last_good: Option<(Instant, ColmapAccelerationStatus)>,
+    last_good: Option<(Instant, AccelerationStatus)>,
 }
 
 fn acceleration_probe_service() -> &'static AccelerationProbeService {
@@ -299,22 +220,84 @@ impl EnginePaths {
         Self::from_candidates(root)
     }
 
-    pub async fn check_all(&self) -> Vec<EngineStatus> {
+    /// 全部组件状态（前端 `check_components` 命令的数据源）。
+    pub async fn check_all(&self) -> Vec<ComponentStatus> {
         self.check_all_with_policy(ProbePolicy::Cached).await
     }
 
-    pub async fn check_all_for_task(&self) -> Vec<EngineStatus> {
+    /// 任务启动前的组件状态（`ProbePolicy::Task` = 不吃缓存）。
+    pub async fn check_all_for_task(&self) -> Vec<ComponentStatus> {
         self.check_all_with_policy(ProbePolicy::Task).await
     }
 
-    async fn check_all_with_policy(&self, policy: ProbePolicy) -> Vec<EngineStatus> {
-        let (ffmpeg, ffprobe, colmap, brush) = tokio::join!(
-            check_basic(EngineKind::Ffmpeg, &self.ffmpeg, &["-version"]),
-            check_basic(EngineKind::Ffprobe, &self.ffprobe, &["-version"]),
+    /// 探测并聚合成**中性组件**。
+    ///
+    /// 前端只看到三类组件（媒体 / 重建 / 训练）；ffmpeg 与 ffprobe 这类工具粒度
+    /// 留在内部，聚合规则见 [`merge_media`]。
+    async fn check_all_with_policy(&self, policy: ProbePolicy) -> Vec<ComponentStatus> {
+        // media-rsmpeg（进程内）：媒体能力在编译期已链接进二进制（FFmpeg 8.x 静态库，
+        // build.rs 的 ABI 守卫已核过版本），**没有外部 ffmpeg/ffprobe 可执行文件要探测**
+        // —— 与重建组件的自研后端同构：不能因为 bundle 里没有二进制就判缺失。
+        // 缺这个分支的真实后果：`OOO_MEDIA_RSMPEG=1` 的产品包资源裁掉了两个二进制，
+        // 顶栏常驻"N 个引擎异常"、开始按钮被禁用。
+        #[cfg(feature = "media-rsmpeg")]
+        let media = in_process_media_status(&self.ffmpeg);
+        #[cfg(not(feature = "media-rsmpeg"))]
+        let media = {
+            let (ffmpeg, ffprobe) = tokio::join!(
+                check_basic(ToolKind::Ffmpeg, &self.ffmpeg, &["-version"]),
+                check_basic(ToolKind::Ffprobe, &self.ffprobe, &["-version"]),
+            );
+            merge_media(ffmpeg, ffprobe)
+        };
+        let (reconstruction, training) = tokio::join!(
             check_colmap(&self.colmap, &self.root, policy),
             check_brush(&self.brush),
         );
-        vec![ffmpeg, ffprobe, colmap, brush]
+        vec![
+            media,
+            reconstruction.component_status(),
+            training.component_status(),
+        ]
+    }
+}
+
+/// 进程内媒体实现（`media-rsmpeg`）的组件状态。
+///
+/// 与自研重建后端分支同构：media-rsmpeg 没有外部可执行文件，ffmpeg 路径仅作
+/// 展示（组件就绪时运行期不会读取它）。
+#[cfg(feature = "media-rsmpeg")]
+fn in_process_media_status(ffmpeg_path: &Path) -> ComponentStatus {
+    ComponentStatus {
+        kind: ComponentKind::Media,
+        ready: true,
+        acceleration: None,
+        detail: "媒体处理在进程内完成（rsmpeg + 静态链接 FFmpeg 8.x）；无需外部 ffmpeg/ffprobe"
+            .into(),
+        location: Some(ffmpeg_path.display().to_string()),
+    }
+}
+
+/// 把 ffmpeg 与 ffprobe 两个工具聚合成一个"媒体"组件。
+///
+/// 两个工具都必须就绪才算媒体能力可用（抽帧与探测缺一不可）。
+fn merge_media(ffmpeg: ToolStatus, ffprobe: ToolStatus) -> ComponentStatus {
+    let ready = ffmpeg.exists
+        && ffmpeg.can_start
+        && ffprobe.exists
+        && ffprobe.can_start;
+    let detail = match (ffmpeg.can_start, ffprobe.can_start) {
+        (true, true) => "媒体工具就绪".to_string(),
+        (true, false) => format!("ffprobe 不可用：{}", ffprobe.detail),
+        (false, true) => format!("ffmpeg 不可用：{}", ffmpeg.detail),
+        (false, false) => format!("ffmpeg：{}；ffprobe：{}", ffmpeg.detail, ffprobe.detail),
+    };
+    ComponentStatus {
+        kind: ComponentKind::Media,
+        ready,
+        acceleration: None,
+        detail,
+        location: Some(ffmpeg.path.display().to_string()),
     }
 }
 
@@ -349,8 +332,8 @@ fn find_on_path(executable_name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn missing(kind: EngineKind, path: &Path) -> EngineStatus {
-    EngineStatus {
+fn missing(kind: ToolKind, path: &Path) -> ToolStatus {
+    ToolStatus {
         kind,
         path: path.to_path_buf(),
         exists: false,
@@ -358,12 +341,11 @@ fn missing(kind: EngineKind, path: &Path) -> EngineStatus {
         version: None,
         cpu_only: None,
         acceleration: None,
-        colmap_cli_family: None,
         detail: format!("未找到 {}", path.display()),
     }
 }
 
-async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStatus {
+async fn check_basic(kind: ToolKind, path: &Path, args: &[&str]) -> ToolStatus {
     if !path.is_file() {
         return missing(kind, path);
     }
@@ -385,7 +367,7 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
                 .lines()
                 .find(|line| !line.trim().is_empty())
                 .map(|line| line.trim().to_owned());
-            EngineStatus {
+            ToolStatus {
                 kind,
                 path: path.to_path_buf(),
                 exists: true,
@@ -393,15 +375,14 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
                 version: first_line,
                 cpu_only: None,
                 acceleration: None,
-                colmap_cli_family: None,
-                detail: if output.success {
+                    detail: if output.success {
                     "引擎可启动".into()
                 } else {
                     format!("帮助命令退出码：{:?}", output.exit_code)
                 },
             }
         }
-        Err(error) => EngineStatus {
+        Err(error) => ToolStatus {
             kind,
             path: path.to_path_buf(),
             exists: true,
@@ -409,14 +390,13 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
             version: None,
             cpu_only: None,
             acceleration: None,
-            colmap_cli_family: None,
             detail: error.to_string(),
         },
     }
 }
 
-async fn check_brush(path: &Path) -> EngineStatus {
-    let mut status = check_basic(EngineKind::Brush, path, &["--version"]).await;
+async fn check_brush(path: &Path) -> ToolStatus {
+    let mut status = check_basic(ToolKind::Training, path, &["--version"]).await;
     if !status.can_start {
         return status;
     }
@@ -462,11 +442,33 @@ async fn check_brush(path: &Path) -> EngineStatus {
     status
 }
 
-async fn check_colmap(path: &Path, engines_root: &Path, probe_policy: ProbePolicy) -> EngineStatus {
+async fn check_colmap(path: &Path, engines_root: &Path, probe_policy: ProbePolicy) -> ToolStatus {
+    // 自研后端（`feature = "backend-ooo-sfm"`）：进程内实现，没有可执行文件要探测 ——
+    // 也不能因为「路径下没有 colmap 二进制」就判成引擎缺失（macOS 上自研后端
+    // 本来就不带 COLMAP）。能力与加速状态由后端自己声明。
+    #[cfg(feature = "backend-ooo-sfm")]
+    {
+        let _ = (engines_root, probe_policy);
+        let component = super::colmap::health::component_status(path.to_path_buf());
+        return ToolStatus {
+            kind: ToolKind::Reconstruction,
+            path: path.to_path_buf(),
+            exists: true,
+            can_start: true,
+            version: Some(super::colmap::LOCKED_VERSION.to_string()),
+            cpu_only: component
+                .acceleration
+                .as_ref()
+                .map(|acceleration| !acceleration.accelerated()),
+            acceleration: component.acceleration,
+            detail: component.detail,
+        };
+    }
+    #[cfg(not(feature = "backend-ooo-sfm"))]
     if !path.is_file() {
-        let mut status = missing(EngineKind::Colmap, path);
+        let mut status = missing(ToolKind::Reconstruction, path);
         status.acceleration = Some(cpu_status(
-            AccelerationReasonCode::ColmapUnavailable,
+            AccelerationReason::ComponentUnavailable,
             format!("未找到 COLMAP：{}", path.display()),
             None,
             requirements_or_default(engines_root),
@@ -509,21 +511,20 @@ async fn check_colmap(path: &Path, engines_root: &Path, probe_policy: ProbePolic
                 help.push_str(&command_help);
             }
             Err(error) => {
-                return EngineStatus {
-                    kind: EngineKind::Colmap,
+                return ToolStatus {
+                    kind: ToolKind::Reconstruction,
                     path: path.to_path_buf(),
                     exists: true,
                     can_start: false,
                     version: None,
                     cpu_only: None,
                     acceleration: Some(cpu_status(
-                        AccelerationReasonCode::ColmapUnavailable,
+                        AccelerationReason::ComponentUnavailable,
                         format!("COLMAP 无法启动：{error}"),
                         None,
                         requirements_or_default(engines_root),
                     )),
-                    colmap_cli_family: None,
-                    detail: error.to_string(),
+                            detail: error.to_string(),
                 }
             }
         }
@@ -569,27 +570,27 @@ async fn check_colmap(path: &Path, engines_root: &Path, probe_policy: ProbePolic
     };
     let acceleration = if !successful {
         cpu_status(
-            AccelerationReasonCode::ColmapUnavailable,
+            AccelerationReason::ComponentUnavailable,
             unavailable_reason,
             None,
             requirements_or_default(engines_root),
         )
     } else if cfg!(target_os = "macos") {
         cpu_status(
-            AccelerationReasonCode::MacOsCpuOnly,
+            AccelerationReason::CpuOnly,
             "macOS Alpha 当前内置 COLMAP CPU 构建；Brush 仍会使用可用的 Metal 后端".into(),
             None,
             requirements_or_default(engines_root),
         )
     } else if cpu_only != Some(false) {
         cpu_status(
-            AccelerationReasonCode::ColmapCudaUnavailable,
+            AccelerationReason::RequirementsUnavailable,
             "内置 COLMAP 未检测到完整 CUDA 运行时，已使用 CPU".into(),
             None,
             requirements_or_default(engines_root),
         )
     } else {
-        detect_acceleration(engines_root, probe_policy).await
+        probe_acceleration(engines_root, probe_policy).await
     };
     let family_label = cli_family.map_or("不支持的 CLI", ColmapCliFamily::label);
     #[cfg(target_os = "macos")]
@@ -613,15 +614,14 @@ async fn check_colmap(path: &Path, engines_root: &Path, probe_policy: ProbePolic
     } else {
         format!("{detail}；{}", ba.detail)
     };
-    EngineStatus {
-        kind: EngineKind::Colmap,
+    ToolStatus {
+        kind: ToolKind::Reconstruction,
         path: path.to_path_buf(),
         exists: true,
         can_start: successful,
         version: first_line,
         cpu_only,
         acceleration: Some(acceleration),
-        colmap_cli_family: cli_family,
         detail,
     }
 }
@@ -681,13 +681,14 @@ fn scan_cuda_runtime(directory: &Path, found: &mut [bool; 2]) {
     }
 }
 
-pub async fn check_colmap_acceleration(paths: &EnginePaths) -> ColmapAccelerationStatus {
+/// 加速状态探测（强制刷新）。
+pub async fn refresh_acceleration(paths: &EnginePaths) -> AccelerationStatus {
     check_colmap(&paths.colmap, &paths.root, ProbePolicy::Refresh)
         .await
         .acceleration
         .unwrap_or_else(|| {
             cpu_status(
-                AccelerationReasonCode::ColmapUnavailable,
+                AccelerationReason::ComponentUnavailable,
                 "无法读取 COLMAP 加速状态，已使用 CPU".into(),
                 None,
                 requirements_or_default(&paths.root),
@@ -695,13 +696,14 @@ pub async fn check_colmap_acceleration(paths: &EnginePaths) -> ColmapAcceleratio
         })
 }
 
-pub async fn check_colmap_acceleration_cached(paths: &EnginePaths) -> ColmapAccelerationStatus {
+/// 加速状态探测（带缓存）。
+pub async fn detect_acceleration(paths: &EnginePaths) -> AccelerationStatus {
     check_colmap(&paths.colmap, &paths.root, ProbePolicy::Cached)
         .await
         .acceleration
         .unwrap_or_else(|| {
             cpu_status(
-                AccelerationReasonCode::ColmapUnavailable,
+                AccelerationReason::ComponentUnavailable,
                 "无法读取 COLMAP 加速状态，已使用 CPU".into(),
                 None,
                 requirements_or_default(&paths.root),
@@ -750,18 +752,18 @@ impl ProbeError {
     }
 }
 
-fn default_requirements() -> AccelerationRequirements {
-    AccelerationRequirements {
+fn default_requirements() -> AcceleratorRequirements {
+    AcceleratorRequirements {
         minimum_driver_version: DEFAULT_MINIMUM_DRIVER.into(),
         minimum_compute_capability: DEFAULT_MINIMUM_COMPUTE_CAPABILITY.into(),
     }
 }
 
-fn requirements_or_default(engines_root: &Path) -> AccelerationRequirements {
+fn requirements_or_default(engines_root: &Path) -> AcceleratorRequirements {
     load_requirements(engines_root).unwrap_or_else(|_| default_requirements())
 }
 
-fn load_requirements(engines_root: &Path) -> std::result::Result<AccelerationRequirements, String> {
+fn load_requirements(engines_root: &Path) -> std::result::Result<AcceleratorRequirements, String> {
     let path = engines_root.join(if cfg!(target_os = "linux") {
         "manifest.linux.json"
     } else {
@@ -782,35 +784,35 @@ fn load_requirements(engines_root: &Path) -> std::result::Result<AccelerationReq
         .ok_or_else(|| "引擎清单中的最低驱动版本无效".to_string())?;
     parse_version(&compatibility.minimum_compute_capability)
         .ok_or_else(|| "引擎清单中的最低 Compute Capability 无效".to_string())?;
-    Ok(AccelerationRequirements {
+    Ok(AcceleratorRequirements {
         minimum_driver_version: compatibility.minimum_windows_driver,
         minimum_compute_capability: compatibility.minimum_compute_capability,
     })
 }
 
 fn cpu_status(
-    reason_code: AccelerationReasonCode,
+    reason_code: AccelerationReason,
     reason: String,
-    device: Option<GpuDeviceInfo>,
-    requirements: AccelerationRequirements,
-) -> ColmapAccelerationStatus {
-    ColmapAccelerationStatus {
-        backend: ColmapBackend::Cpu,
-        detection_state: GpuDetectionState::Unavailable,
+    device: Option<AcceleratorDevice>,
+    requirements: AcceleratorRequirements,
+) -> AccelerationStatus {
+    AccelerationStatus {
+        mode: AccelerationMode::Cpu,
+        state: AccelerationState::Unavailable,
         reason_code,
         reason,
         device,
         requirements,
-        detected_nvidia_device_count: 0,
+        detected_device_count: 0,
     }
 }
 
-async fn detect_acceleration(engines_root: &Path, policy: ProbePolicy) -> ColmapAccelerationStatus {
+async fn probe_acceleration(engines_root: &Path, policy: ProbePolicy) -> AccelerationStatus {
     let requirements = match load_requirements(engines_root) {
         Ok(requirements) => requirements,
         Err(error) => {
             return cpu_status(
-                AccelerationReasonCode::RequirementsUnavailable,
+                AccelerationReason::RequirementsUnavailable,
                 format!("{error}，已为兼容性使用 CPU"),
                 None,
                 default_requirements(),
@@ -825,9 +827,9 @@ async fn detect_acceleration(engines_root: &Path, policy: ProbePolicy) -> Colmap
 impl AccelerationProbeService {
     async fn probe(
         &self,
-        requirements: AccelerationRequirements,
+        requirements: AcceleratorRequirements,
         policy: ProbePolicy,
-    ) -> ColmapAccelerationStatus {
+    ) -> AccelerationStatus {
         if policy == ProbePolicy::Cached {
             if let Some(status) = self.fresh_status().await {
                 return status;
@@ -861,8 +863,8 @@ impl AccelerationProbeService {
                     append_acceleration_diagnostic(&format!(
                         "attempt={} outcome=success backend={:?} devices={}",
                         attempt + 1,
-                        status.backend,
-                        status.detected_nvidia_device_count
+                        status.mode,
+                        status.detected_device_count
                     ));
                     return status;
                 }
@@ -890,7 +892,7 @@ impl AccelerationProbeService {
         transient_probe_status(last_error, requirements, cached)
     }
 
-    async fn fresh_status(&self) -> Option<ColmapAccelerationStatus> {
+    async fn fresh_status(&self) -> Option<AccelerationStatus> {
         self.state
             .lock()
             .await
@@ -903,12 +905,12 @@ impl AccelerationProbeService {
 
 fn transient_probe_status(
     error: ProbeError,
-    requirements: AccelerationRequirements,
-    cached: Option<ColmapAccelerationStatus>,
-) -> ColmapAccelerationStatus {
+    requirements: AcceleratorRequirements,
+    cached: Option<AccelerationStatus>,
+) -> AccelerationStatus {
     let fallback = probe_error_status(error, requirements);
     if let Some(mut status) = cached {
-        status.detection_state = GpuDetectionState::TemporarilyUnavailable;
+        status.state = AccelerationState::TemporarilyUnavailable;
         status.reason_code = fallback.reason_code;
         status.reason = format!(
             "NVIDIA 显卡暂时无法检测；继续显示本次运行中最近一次有效结果。{}",
@@ -922,42 +924,42 @@ fn transient_probe_status(
 
 fn probe_error_status(
     error: ProbeError,
-    requirements: AccelerationRequirements,
-) -> ColmapAccelerationStatus {
+    requirements: AcceleratorRequirements,
+) -> AccelerationStatus {
     let (reason_code, reason) = match error {
         ProbeError::NotFound => (
-            AccelerationReasonCode::NvidiaSmiNotFound,
+            AccelerationReason::NoAccelerator,
             "未检测到 NVIDIA 驱动，已使用 CPU",
         ),
         ProbeError::Timeout => (
-            AccelerationReasonCode::ProbeTimeout,
+            AccelerationReason::ProbeTimeout,
             "NVIDIA 显卡检测超时，已使用 CPU",
         ),
         ProbeError::NoGpu => (
-            AccelerationReasonCode::NoNvidiaGpu,
+            AccelerationReason::NoAccelerator,
             "未检测到 NVIDIA 显卡，已使用 CPU",
         ),
         ProbeError::InvalidOutput => (
-            AccelerationReasonCode::ComputeCapabilityUnknown,
+            AccelerationReason::ComputeCapabilityUnknown,
             "无法读取显卡驱动或 Compute Capability，已使用 CPU",
         ),
         ProbeError::Failed => (
-            AccelerationReasonCode::ProbeFailed,
+            AccelerationReason::ProbeFailed,
             "NVIDIA 显卡检测失败，已使用 CPU",
         ),
     };
     let mut status = cpu_status(reason_code, reason.into(), None, requirements);
     if error.is_transient() {
-        status.detection_state = GpuDetectionState::TemporarilyUnavailable;
+        status.state = AccelerationState::TemporarilyUnavailable;
     }
     status
 }
 
 fn choose_acceleration(
-    devices: Vec<GpuDeviceInfo>,
-    requirements: AccelerationRequirements,
-) -> ColmapAccelerationStatus {
-    let detected_nvidia_device_count = devices.len();
+    devices: Vec<AcceleratorDevice>,
+    requirements: AcceleratorRequirements,
+) -> AccelerationStatus {
+    let detected_device_count = devices.len();
     let minimum_driver = parse_version(&requirements.minimum_driver_version)
         .expect("validated acceleration requirement");
     let minimum_compute = parse_version(&requirements.minimum_compute_capability)
@@ -977,17 +979,17 @@ fn choose_acceleration(
         .collect::<Vec<_>>();
     compatible.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
     if let Some((_, _, device)) = compatible.into_iter().next() {
-        return ColmapAccelerationStatus {
-            backend: ColmapBackend::Gpu,
-            detection_state: GpuDetectionState::Ready,
-            reason_code: AccelerationReasonCode::GpuReady,
+        return AccelerationStatus {
+            mode: AccelerationMode::Gpu,
+            state: AccelerationState::Ready,
+            reason_code: AccelerationReason::GpuReady,
             reason: format!(
                 "已启用 {}（驱动 {}，Compute Capability {}）",
                 device.name, device.driver_version, device.compute_capability
             ),
             device: Some(device),
             requirements,
-            detected_nvidia_device_count,
+            detected_device_count,
         };
     }
 
@@ -1005,7 +1007,7 @@ fn choose_acceleration(
     low_compute.sort_by_key(|item| std::cmp::Reverse(item.0));
     if let Some((_, device)) = low_compute.into_iter().next() {
         return cpu_status(
-            AccelerationReasonCode::ComputeCapabilityTooLow,
+            AccelerationReason::ComputeCapabilityTooLow,
             format!(
                 "{} 的 Compute Capability {} 低于最低要求 {}，已使用 CPU",
                 device.name, device.compute_capability, requirements.minimum_compute_capability
@@ -1019,7 +1021,7 @@ fn choose_acceleration(
             && parse_version(&device.compute_capability).is_none()
     }) {
         return cpu_status(
-            AccelerationReasonCode::ComputeCapabilityUnknown,
+            AccelerationReason::ComputeCapabilityUnknown,
             format!("无法读取 {} 的 Compute Capability，已使用 CPU", device.name),
             Some(device.clone()),
             requirements,
@@ -1033,7 +1035,7 @@ fn choose_acceleration(
     old_driver.sort_by_key(|item| std::cmp::Reverse(item.0));
     if let Some((_, device)) = old_driver.into_iter().next() {
         return cpu_status(
-            AccelerationReasonCode::DriverTooOld,
+            AccelerationReason::DriverTooOld,
             format!(
                 "NVIDIA 驱动 {} 低于最低要求 {}，已使用 CPU",
                 device.driver_version, requirements.minimum_driver_version
@@ -1044,18 +1046,18 @@ fn choose_acceleration(
     }
     let device = devices.into_iter().next();
     cpu_status(
-        AccelerationReasonCode::DriverVersionUnknown,
+        AccelerationReason::DriverVersionUnknown,
         "无法读取 NVIDIA 驱动版本，已使用 CPU".into(),
         device,
         requirements,
     )
 }
 
-pub(crate) async fn diagnostic_gpu_devices() -> Vec<GpuDeviceInfo> {
+pub(crate) async fn diagnostic_gpu_devices() -> Vec<AcceleratorDevice> {
     probe_gpu_devices().await.unwrap_or_default()
 }
 
-async fn probe_gpu_devices() -> std::result::Result<Vec<GpuDeviceInfo>, ProbeError> {
+async fn probe_gpu_devices() -> std::result::Result<Vec<AcceleratorDevice>, ProbeError> {
     let candidate = nvidia_smi_candidates()
         .into_iter()
         .find(|candidate| candidate.is_file());
@@ -1169,7 +1171,7 @@ fn append_acceleration_diagnostic(message: &str) {
     }
 }
 
-fn parse_nvidia_smi_csv(output: &str) -> std::result::Result<Vec<GpuDeviceInfo>, ProbeError> {
+fn parse_nvidia_smi_csv(output: &str) -> std::result::Result<Vec<AcceleratorDevice>, ProbeError> {
     let mut devices = Vec::new();
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
@@ -1179,7 +1181,7 @@ fn parse_nvidia_smi_csv(output: &str) -> std::result::Result<Vec<GpuDeviceInfo>,
         let index = fields[0]
             .parse::<u32>()
             .map_err(|_| ProbeError::InvalidOutput)?;
-        devices.push(GpuDeviceInfo {
+        devices.push(AcceleratorDevice {
             index,
             name: fields[1..fields.len() - 3].join(", "),
             driver_version: fields[fields.len() - 3].to_string(),
@@ -1224,8 +1226,67 @@ pub(crate) fn nvidia_smi_candidates() -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    fn requirements() -> AccelerationRequirements {
+    fn requirements() -> AcceleratorRequirements {
         default_requirements()
+    }
+
+    /// 自研后端（`feature = "backend-ooo-sfm"`）：**没有 COLMAP 二进制也必须报就绪**。
+    ///
+    /// 这条守的是真实卡点：`runner.rs::verify_pipeline_engines` 会遍历
+    /// `check_all_for_task()` 的结果，只要 COLMAP 的 `exists == false` 就直接
+    /// `EngineMissing` —— 而自研后端是进程内的，路径下本来就不该有二进制。
+    #[cfg(feature = "backend-ooo-sfm")]
+    #[tokio::test]
+    async fn self_hosted_backend_needs_no_colmap_binary() {
+        let missing = std::path::PathBuf::from("/definitely/not/here/colmap");
+        let status = check_colmap(&missing, Path::new("/definitely/not/here"), ProbePolicy::Task).await;
+        assert!(status.exists, "自研后端不应被判为缺引擎：{status:?}");
+        assert!(status.can_start, "自研后端应可启动：{status:?}");
+        assert!(status.exists && status.can_start, "自研后端应就绪：{status:?}");
+        assert!(status.acceleration.is_some(), "自研后端应上报加速状态");
+        assert!(status.detail.contains("自研后端"), "{}", status.detail);
+        // 加速状态也必须存在（前端零改动依赖它），且与 Metal feature 一致。
+        let acceleration = status.acceleration.expect("自研后端必须上报加速状态");
+        assert_eq!(
+            acceleration.use_gpu(),
+            crate::engines::colmap::health::metal_active()
+        );
+    }
+
+    /// 进程内媒体（`media-rsmpeg`）：**没有 ffmpeg/ffprobe 二进制也必须报就绪**。
+    ///
+    /// 对称于 `self_hosted_backend_needs_no_colmap_binary`（重建组件的进程内分支）。
+    /// 缺这条分支的真实事故：`OOO_MEDIA_RSMPEG=1` 的产品包把两个二进制裁掉了，
+    /// 媒体组件永远 `ready=false` → 顶栏常驻"N 个引擎异常"、前端 `canStart`
+    /// 因 missingComponents 非空被禁用，任务侧也会 EngineMissing。
+    #[cfg(feature = "media-rsmpeg")]
+    #[tokio::test]
+    async fn in_process_media_needs_no_cli_binaries() {
+        let paths = EnginePaths::from_candidates(PathBuf::from(
+            "/definitely/not/here/macos/arm64",
+        ));
+        assert!(!paths.ffmpeg.is_file());
+        assert!(!paths.ffprobe.is_file());
+        let statuses = paths.check_all().await;
+        let media = statuses
+            .iter()
+            .find(|status| status.kind == ComponentKind::Media)
+            .expect("媒体组件必须存在");
+        assert!(media.ready, "进程内媒体不应要求 CLI 二进制：{media:?}");
+        assert!(media.detail.contains("进程内"), "{}", media.detail);
+    }
+
+    /// 反向保证：不带 feature 时 COLMAP 缺失仍然要判缺（主分支行为不变）。
+    #[cfg(not(feature = "backend-ooo-sfm"))]
+    #[tokio::test]
+    async fn missing_colmap_binary_is_still_reported() {
+        let status = check_colmap(
+            std::path::Path::new("/definitely/not/here/colmap"),
+            Path::new("/definitely/not/here"),
+            ProbePolicy::Task,
+        )
+        .await;
+        assert!(!status.exists);
     }
 
     #[cfg(all(not(windows), not(target_os = "macos")))]
@@ -1303,8 +1364,8 @@ mod tests {
         assert_eq!(status.version.as_deref(), Some("brush-cli 1.0.0"));
     }
 
-    fn device(index: u32, driver: &str, compute: &str) -> GpuDeviceInfo {
-        GpuDeviceInfo {
+    fn device(index: u32, driver: &str, compute: &str) -> AcceleratorDevice {
+        AcceleratorDevice {
             index,
             name: format!("GPU {index}"),
             driver_version: driver.into(),
@@ -1338,8 +1399,8 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            choose_acceleration(devices, requirements()).backend,
-            ColmapBackend::Gpu
+            choose_acceleration(devices, requirements()).mode,
+            AccelerationMode::Gpu
         );
     }
 
@@ -1355,17 +1416,17 @@ mod tests {
     #[test]
     fn accepts_exact_compatibility_boundaries() {
         let status = choose_acceleration(vec![device(0, "580.00", "7.5")], requirements());
-        assert_eq!(status.backend, ColmapBackend::Gpu);
-        assert_eq!(status.reason_code, AccelerationReasonCode::GpuReady);
+        assert_eq!(status.mode, AccelerationMode::Gpu);
+        assert_eq!(status.reason_code, AccelerationReason::GpuReady);
         assert_eq!(status.usable_gpu_total_memory_mb(), Some(8_192));
-        assert_eq!(status.detected_nvidia_device_count, 1);
+        assert_eq!(status.detected_device_count, 1);
     }
 
     #[test]
     fn rejects_old_driver_and_low_compute_capability() {
         let old_driver = choose_acceleration(vec![device(0, "579.99", "8.6")], requirements());
-        assert_eq!(old_driver.backend, ColmapBackend::Cpu);
-        assert_eq!(old_driver.reason_code, AccelerationReasonCode::DriverTooOld);
+        assert_eq!(old_driver.mode, AccelerationMode::Cpu);
+        assert_eq!(old_driver.reason_code, AccelerationReason::DriverTooOld);
         assert_eq!(
             old_driver.device.as_ref().unwrap().total_memory_mb,
             Some(8_192)
@@ -1374,10 +1435,10 @@ mod tests {
         assert_eq!(old_driver.planning_gpu_total_memory_mb(), None);
 
         let old_gpu = choose_acceleration(vec![device(0, "580.00", "7.4")], requirements());
-        assert_eq!(old_gpu.backend, ColmapBackend::Cpu);
+        assert_eq!(old_gpu.mode, AccelerationMode::Cpu);
         assert_eq!(
             old_gpu.reason_code,
-            AccelerationReasonCode::ComputeCapabilityTooLow
+            AccelerationReason::ComputeCapabilityTooLow
         );
     }
 
@@ -1391,7 +1452,7 @@ mod tests {
             ],
             requirements(),
         );
-        assert_eq!(status.detected_nvidia_device_count, 3);
+        assert_eq!(status.detected_device_count, 3);
         assert_eq!(status.device.unwrap().index, 0);
     }
 
@@ -1400,25 +1461,25 @@ mod tests {
         for (error, reason) in [
             (
                 ProbeError::NotFound,
-                AccelerationReasonCode::NvidiaSmiNotFound,
+                AccelerationReason::NoAccelerator,
             ),
-            (ProbeError::Failed, AccelerationReasonCode::ProbeFailed),
-            (ProbeError::Timeout, AccelerationReasonCode::ProbeTimeout),
-            (ProbeError::NoGpu, AccelerationReasonCode::NoNvidiaGpu),
+            (ProbeError::Failed, AccelerationReason::ProbeFailed),
+            (ProbeError::Timeout, AccelerationReason::ProbeTimeout),
+            (ProbeError::NoGpu, AccelerationReason::NoAccelerator),
             (
                 ProbeError::InvalidOutput,
-                AccelerationReasonCode::ComputeCapabilityUnknown,
+                AccelerationReason::ComputeCapabilityUnknown,
             ),
         ] {
             let status = probe_error_status(error, requirements());
-            assert_eq!(status.backend, ColmapBackend::Cpu);
+            assert_eq!(status.mode, AccelerationMode::Cpu);
             assert_eq!(status.reason_code, reason);
             assert_eq!(
-                status.detection_state,
+                status.state,
                 if error.is_transient() {
-                    GpuDetectionState::TemporarilyUnavailable
+                    AccelerationState::TemporarilyUnavailable
                 } else {
-                    GpuDetectionState::Unavailable
+                    AccelerationState::Unavailable
                 }
             );
         }
@@ -1428,10 +1489,10 @@ mod tests {
     fn transient_probe_keeps_a_recent_result_for_planning_only() {
         let cached = choose_acceleration(vec![device(0, "580.00", "8.6")], requirements());
         let status = transient_probe_status(ProbeError::Timeout, requirements(), Some(cached));
-        assert_eq!(status.backend, ColmapBackend::Gpu);
+        assert_eq!(status.mode, AccelerationMode::Gpu);
         assert_eq!(
-            status.detection_state,
-            GpuDetectionState::TemporarilyUnavailable
+            status.state,
+            AccelerationState::TemporarilyUnavailable
         );
         assert_eq!(status.planning_gpu_total_memory_mb(), Some(8_192));
     }
@@ -1441,10 +1502,10 @@ mod tests {
         let service = AccelerationProbeService::default();
         let _active_probe = service.run_lock.lock().await;
         let status = service.probe(requirements(), ProbePolicy::Cached).await;
-        assert_eq!(status.backend, ColmapBackend::Cpu);
+        assert_eq!(status.mode, AccelerationMode::Cpu);
         assert_eq!(
-            status.detection_state,
-            GpuDetectionState::TemporarilyUnavailable
+            status.state,
+            AccelerationState::TemporarilyUnavailable
         );
     }
 

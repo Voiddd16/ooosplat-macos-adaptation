@@ -13,14 +13,15 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use crate::{
+    contracts::ComponentKind,
+    engines::backend::request::{
+        FeatureExtraction, IncrementalFeatureExtraction, IncrementalMapping, Matching,
+        PairMatching, QualityFeatureExtraction, SparseMapping,
+    },
     engines::{
         brush, colmap,
-        ffmpeg::{
-            extract_additional_frames, extract_selected_frames, extract_uniform_frames,
-            validate_extraction,
-        },
-        ffprobe::probe_video,
-        EngineKind, EnginePaths,
+        ffmpeg::validate_extraction,
+        EnginePaths,
     },
     error::{Result, SplatError},
     pipeline::{
@@ -35,7 +36,7 @@ use crate::{
         },
         progress::stage_progress_range,
         runtime::{RuntimeSnapshot, RuntimeTracker},
-        EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
+        EventKind, EventLevel, PipelineComponent, PipelineEvent, PipelineStage,
     },
     planner::{
         bridge_trigger_ratio, plan_bridge_backfill, read_registered_source_indices,
@@ -155,7 +156,7 @@ impl EventSink {
     fn send(
         &self,
         stage: PipelineStage,
-        engine: Option<PipelineEngine>,
+        component: Option<PipelineComponent>,
         kind: EventKind,
         level: EventLevel,
         stage_progress: Option<f32>,
@@ -195,7 +196,7 @@ impl EventSink {
             kind,
             level,
             stage,
-            engine,
+            component,
             progress,
             stage_progress: stage_progress.map(|value| value.clamp(0.0, 1.0) * 100.0),
             indeterminate,
@@ -212,7 +213,7 @@ impl EventSink {
     fn stage(&self, stage: PipelineStage, progress: f32, message: impl Into<String>) {
         self.send(
             stage,
-            Some(PipelineEngine::System),
+            Some(PipelineComponent::System),
             EventKind::Stage,
             EventLevel::Info,
             Some(progress),
@@ -224,7 +225,7 @@ impl EventSink {
         );
     }
 
-    fn acceleration(&self, status: crate::engines::ColmapAccelerationStatus) {
+    fn acceleration(&self, status: crate::engines::AccelerationStatus) {
         let _dispatch = self
             .dispatch
             .lock()
@@ -242,7 +243,7 @@ impl EventSink {
                 EventLevel::Warning
             },
             stage: PipelineStage::Created,
-            engine: Some(PipelineEngine::Colmap),
+            component: Some(PipelineComponent::Reconstruction),
             progress: 0.0,
             stage_progress: None,
             indeterminate: false,
@@ -256,7 +257,7 @@ impl EventSink {
         });
     }
 
-    fn runtime(&self, stage: PipelineStage, engine: PipelineEngine, snapshot: RuntimeSnapshot) {
+    fn runtime(&self, stage: PipelineStage, component: PipelineComponent, snapshot: RuntimeSnapshot) {
         let _dispatch = self
             .dispatch
             .lock()
@@ -270,7 +271,7 @@ impl EventSink {
             kind: EventKind::Runtime,
             level: EventLevel::Info,
             stage,
-            engine: Some(engine),
+            component: Some(component),
             progress: self.last_progress_milli_percent.load(Ordering::Relaxed) as f32 / 1_000.0,
             stage_progress: None,
             indeterminate: true,
@@ -307,7 +308,7 @@ impl EventSink {
             } else {
                 PipelineStage::Failed
             },
-            engine: Some(PipelineEngine::System),
+            component: Some(PipelineComponent::System),
             progress: self.last_progress_milli_percent.load(Ordering::Relaxed) as f32 / 1_000.0,
             stage_progress: None,
             indeterminate: false,
@@ -347,7 +348,7 @@ pub enum RunnerUpdate {
         offset: u64,
     },
     ProcessExited {
-        engine: PipelineEngine,
+        component: PipelineComponent,
         exit_code: Option<i32>,
     },
 }
@@ -356,10 +357,14 @@ pub struct PipelineRunner {
     lifecycle: Option<Arc<dyn Fn(RunnerUpdate) + Send + Sync>>,
     input_boundary: Option<PathBuf>,
     engines: EnginePaths,
+    /// 稀疏重建后端（编译期选定的实现，契约见 `engines::backend`）。
+    backend: Arc<dyn crate::engines::backend::SfMBackend>,
+    /// 媒体处理实现（编译期选定：外部 ffmpeg 进程 / 进程内 FFmpeg 库）。
+    media: Arc<dyn crate::media::MediaTool>,
     process_manager: ProcessManager,
     events: EventSink,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
-    current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::ColmapAccelerationStatus>>>,
+    current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::AccelerationStatus>>>,
     elapsed_offset_ms: AtomicU64,
     workspace_task_id: Option<uuid::Uuid>,
     planner_enabled: bool,
@@ -386,6 +391,15 @@ impl PipelineRunner {
         emit: impl Fn(PipelineEvent) + Send + Sync + 'static,
     ) -> Self {
         Self {
+            backend: crate::engines::backend::active(crate::engines::backend::BackendConfig {
+                executable: Some(engines.colmap.clone()),
+                automatic_optimization: true,
+                accelerator_index: None,
+            }),
+            media: crate::media::active(crate::media::MediaConfig {
+                ffmpeg: Some(engines.ffmpeg.clone()),
+                ffprobe: Some(engines.ffprobe.clone()),
+            }),
             engines,
             lifecycle: None,
             input_boundary: None,
@@ -404,6 +418,37 @@ impl PipelineRunner {
             workspace_task_id: None,
             planner_enabled,
             effectiveness: None,
+        }
+    }
+
+    /// 构造一次后端作业的运行环境。
+    ///
+    /// 这是 pipeline 与后端之间**唯一**的交接点：日志位置、进度观察者、进程托管器、
+    /// 加速器选择。后端拿不到可执行文件路径，也不需要知道 pipeline 的内部状态。
+    fn job_context(
+        &self,
+        log: PathBuf,
+        observer: Option<crate::process::ProcessObserver>,
+        accelerator_index: Option<u32>,
+    ) -> crate::engines::backend::JobContext<'_> {
+        crate::engines::backend::JobContext::new(
+            log,
+            observer,
+            &self.process_manager,
+            accelerator_index,
+        )
+    }
+
+    /// 构造媒体作业的运行环境（与实现无关）。
+    fn media_context(
+        &self,
+        log_path: Option<PathBuf>,
+        observer: Option<crate::process::ProcessObserver>,
+    ) -> crate::media::MediaContext<'_> {
+        crate::media::MediaContext {
+            process_manager: &self.process_manager,
+            observer,
+            log_path,
         }
     }
 
@@ -429,14 +474,16 @@ impl PipelineRunner {
                         exit_code,
                     } => {
                         let name = executable.file_stem().unwrap_or_default().to_string_lossy();
-                        let engine = if name.contains("brush") {
-                            PipelineEngine::Brush
+                        // 从可执行文件名推断组件类别：进程内后端没有可执行文件，
+                        // 由 runtime 侧自己上报（`Runtime` 事件），不会走这里。
+                        let component = if name.contains("brush") {
+                            PipelineComponent::Training
                         } else if name.contains("colmap") {
-                            PipelineEngine::Colmap
+                            PipelineComponent::Reconstruction
                         } else {
-                            PipelineEngine::Ffmpeg
+                            PipelineComponent::Media
                         };
-                        observe(RunnerUpdate::ProcessExited { engine, exit_code });
+                        observe(RunnerUpdate::ProcessExited { component, exit_code });
                     }
                     _ => {}
                 }));
@@ -533,14 +580,14 @@ impl PipelineRunner {
     pub(crate) fn record_reconstruction_metrics(
         &self,
         report: &ReconstructionReport,
-        acceleration: &crate::engines::ColmapAccelerationStatus,
+        acceleration: &crate::engines::AccelerationStatus,
         allow_two_view_tracks: bool,
         is_reshoot: bool,
     ) {
         let Some(tracker) = &self.effectiveness else {
             return;
         };
-        tracker.record_gpu_vendor(if acceleration.detected_nvidia_device_count > 0 {
+        tracker.record_gpu_vendor(if acceleration.detected_device_count > 0 {
             PlannerGpuVendor::Nvidia
         } else if cfg!(target_os = "macos") {
             PlannerGpuVendor::Apple
@@ -551,7 +598,7 @@ impl PipelineRunner {
             input_images: report.input_images,
             registered_images: report.registered_images,
             points_3d: report.points_3d,
-            backend: acceleration.backend,
+            backend: acceleration.mode,
             allow_two_view_tracks,
         });
         if is_reshoot {
@@ -639,44 +686,57 @@ impl PipelineRunner {
         }
     }
 
-    pub fn current_acceleration(&self) -> Option<crate::engines::ColmapAccelerationStatus> {
+    pub fn current_acceleration(&self) -> Option<crate::engines::AccelerationStatus> {
         self.current_acceleration
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
+    /// 任务启动前的组件校验。
+    ///
+    /// 只认**中性组件类别**（媒体 / 重建 / 训练）：具体是哪个二进制、哪个后端，
+    /// 由 `engines::health` 与 `engines::backend` 各自负责回答。
     pub async fn verify_pipeline_engines(
         &self,
-    ) -> Result<crate::engines::ColmapAccelerationStatus> {
+    ) -> Result<crate::engines::AccelerationStatus> {
         let statuses = self.engines.check_all_for_task().await;
         for required in [
-            EngineKind::Ffmpeg,
-            EngineKind::Ffprobe,
-            EngineKind::Colmap,
-            EngineKind::Brush,
+            ComponentKind::Media,
+            ComponentKind::Reconstruction,
+            ComponentKind::Training,
         ] {
             let status = statuses
                 .iter()
                 .find(|status| status.kind == required)
-                .expect("all engine kinds returned");
-            if !status.exists {
-                return Err(SplatError::EngineMissing(status.path.display().to_string()));
-            }
-            if !status.can_start {
-                return Err(SplatError::EngineStart {
-                    engine: format!("{required:?}"),
-                    detail: status.detail.clone(),
+                .expect("all component kinds returned");
+            if !status.ready {
+                let location = status
+                    .location
+                    .clone()
+                    .unwrap_or_else(|| required.label().to_string());
+                // 组件在但起不来 → EngineStart；组件根本不在 → ComponentMissing。
+                let present = std::path::Path::new(&location).exists();
+                return Err(if present {
+                    SplatError::EngineStart {
+                        component: required.label().to_string(),
+                        detail: status.detail.clone(),
+                    }
+                } else {
+                    SplatError::ComponentMissing(location)
                 });
             }
         }
-        colmap::require_verified_cli(&self.engines.colmap)?;
+        // 重建后端的就绪校验（外部 CLI 校验二进制；进程内后端是 no-op）。
+        self.backend.require_ready()?;
         brush::require_verified_cli(&self.engines.brush)?;
         let acceleration = statuses
             .into_iter()
-            .find(|status| status.kind == EngineKind::Colmap)
+            .find(|status| status.kind == ComponentKind::Reconstruction)
             .and_then(|status| status.acceleration)
-            .ok_or_else(|| SplatError::UnsupportedEngine("无法确定 COLMAP 自动加速状态".into()))?;
+            .ok_or_else(|| {
+                SplatError::UnsupportedBackend("无法确定重建后端的加速状态".into())
+            })?;
         *self
             .current_acceleration
             .lock()
@@ -702,13 +762,12 @@ impl PipelineRunner {
         let video = match probed_video {
             Some(video) => video,
             None => {
-                probe_video(
-                    &self.engines.ffprobe,
-                    input,
-                    logs.map(|path| path.join("ffprobe.log")),
-                    &self.process_manager,
-                )
-                .await?
+                self.media
+                    .probe_video(
+                        &self.media_context(logs.map(|path| path.join("ffprobe.log")), None),
+                        input,
+                    )
+                    .await?
             }
         };
         let probe_message = if video.has_alpha {
@@ -748,47 +807,57 @@ impl PipelineRunner {
             PipelineStage::ExtractingFrames,
             0.0,
             if video.has_alpha {
-                "FFmpeg 正在同步提取透明 PNG 画面与 COLMAP Mask"
+                "正在同步提取透明 PNG 画面与掩膜"
             } else {
                 "FFmpeg 开始提取画面"
             },
         );
         let observer = self.process_observer(
             PipelineStage::ExtractingFrames,
-            PipelineEngine::Ffmpeg,
+            PipelineComponent::Media,
             Some(plan.estimated_frames),
             ObserverMode::Ffmpeg,
         );
         let extraction = if planner_enabled {
-            extract_selected_frames(
-                &self.engines.ffmpeg,
-                input,
-                output,
-                colmap_output,
-                masks,
-                &plan.selected_frames,
-                video.has_alpha,
-                target_dimensions,
-                logs.map(|path| path.join("ffmpeg.log")),
-                &self.process_manager,
-                Some(observer),
-            )
-            .await?
+            self.media
+                .extract_selected_frames(
+                    &self.media_context(
+                        logs.map(|path| path.join("ffmpeg.log")),
+                        Some(observer.clone()),
+                    ),
+                    crate::media::SelectedFrameExtraction {
+                        base: crate::media::FrameExtraction {
+                            input: input.to_path_buf(),
+                            output_directory: output.to_path_buf(),
+                            colmap_directory: colmap_output.to_path_buf(),
+                            mask_directory: masks.to_path_buf(),
+                            has_alpha: video.has_alpha,
+                            target_dimensions,
+                        },
+                        selected_frames: plan.selected_frames.clone(),
+                    },
+                )
+                .await?
         } else {
-            extract_uniform_frames(
-                &self.engines.ffmpeg,
-                input,
-                output,
-                colmap_output,
-                masks,
-                &plan,
-                video.has_alpha,
-                target_dimensions,
-                logs.map(|path| path.join("ffmpeg.log")),
-                &self.process_manager,
-                Some(observer),
-            )
-            .await?
+            self.media
+                .extract_uniform_frames(
+                    &self.media_context(
+                        logs.map(|path| path.join("ffmpeg.log")),
+                        Some(observer.clone()),
+                    ),
+                    crate::media::UniformFrameExtraction {
+                        base: crate::media::FrameExtraction {
+                            input: input.to_path_buf(),
+                            output_directory: output.to_path_buf(),
+                            colmap_directory: colmap_output.to_path_buf(),
+                            mask_directory: masks.to_path_buf(),
+                            has_alpha: video.has_alpha,
+                            target_dimensions,
+                        },
+                        plan: plan.clone(),
+                    },
+                )
+                .await?
         };
         if let Some(expected) = target_dimensions {
             if (extraction.width, extraction.height) != expected {
@@ -900,7 +969,7 @@ impl PipelineRunner {
             };
             events.send(
                 PipelineStage::ExtractingFrames,
-                Some(PipelineEngine::System),
+                Some(PipelineComponent::System),
                 EventKind::Stage,
                 EventLevel::Info,
                 Some(progress.stage_progress),
@@ -1002,7 +1071,7 @@ impl PipelineRunner {
                 };
                 events.send(
                     PipelineStage::ProbingVideo,
-                    Some(PipelineEngine::System),
+                    Some(PipelineComponent::System),
                     EventKind::Stage,
                     EventLevel::Info,
                     Some(0.1 + 0.9 * ratio),
@@ -1193,7 +1262,8 @@ impl PipelineRunner {
                 }
                 ReshootInputType::Video => {
                     let video =
-                        probe_video(&self.engines.ffprobe, input, None, &self.process_manager)
+                        self.media
+                            .probe_video(&self.media_context(None, None), input)
                             .await?;
                     let plan =
                         UniformRatioFrameSelection.create_plan(&video, &source.quality.preset());
@@ -1294,7 +1364,7 @@ impl PipelineRunner {
                 };
                 events.send(
                     PipelineStage::ProbingVideo,
-                    Some(PipelineEngine::System),
+                    Some(PipelineComponent::System),
                     EventKind::Stage,
                     EventLevel::Info,
                     Some(0.1 + 0.9 * ratio),
@@ -1395,7 +1465,7 @@ impl PipelineRunner {
         paths: ProjectPaths,
         metadata: &mut ProjectMetadata,
         state: PipelineStateFile,
-        acceleration: &crate::engines::ColmapAccelerationStatus,
+        acceleration: &crate::engines::AccelerationStatus,
     ) -> Result<PipelineResult> {
         if let Some(observer) = &self.lifecycle {
             observer(RunnerUpdate::Project(Box::new(metadata.clone())));
@@ -1477,7 +1547,7 @@ impl PipelineRunner {
         paths: &ProjectPaths,
         metadata: &mut ProjectMetadata,
         mut state: PipelineStateFile,
-        acceleration: &crate::engines::ColmapAccelerationStatus,
+        acceleration: &crate::engines::AccelerationStatus,
     ) -> Result<PipelineResult> {
         let provenance = metadata
             .reshoot
@@ -1664,7 +1734,7 @@ impl PipelineRunner {
                         };
                         events.send(
                             PipelineStage::ExtractingFrames,
-                            Some(PipelineEngine::System),
+                            Some(PipelineComponent::System),
                             EventKind::Stage,
                             EventLevel::Info,
                             Some(progress.stage_progress),
@@ -1697,13 +1767,13 @@ impl PipelineRunner {
                     reset_directory(&temporary).await?;
                     reset_directory(&temporary_colmap).await?;
                     reset_directory(&temporary_masks).await?;
-                    let supplemental_video = probe_video(
-                        &self.engines.ffprobe,
-                        &metadata.source_path,
-                        Some(paths.logs.join("ffprobe.log")),
-                        &self.process_manager,
-                    )
-                    .await?;
+                    let supplemental_video = self
+                        .media
+                        .probe_video(
+                            &self.media_context(Some(paths.logs.join("ffprobe.log")), None),
+                            &metadata.source_path,
+                        )
+                        .await?;
                     state.video = Some(supplemental_video.clone());
                     let target_width = u32::try_from(provenance.width).map_err(|_| {
                         SplatError::Process("Reshoot target width exceeds supported range".into())
@@ -1785,7 +1855,7 @@ impl PipelineRunner {
                 .await?;
             self.events.send(
                 PipelineStage::ExtractingFrames,
-                Some(PipelineEngine::System),
+                Some(PipelineComponent::System),
                 EventKind::Progress,
                 EventLevel::Info,
                 Some(1.0),
@@ -1810,30 +1880,31 @@ impl PipelineRunner {
                 0.0,
                 format!("正在使用 {backend_label} 提取补拍画面的信息"),
             );
-            colmap::extract_incremental_features(
-                &self.engines.colmap,
-                &database,
-                Path::new("../colmap_frames"),
-                Path::new("reshoot-images.txt"),
-                provenance.camera_id,
-                prepared.has_alpha.then_some(Path::new("../reshoot-masks")),
-                (!state.planner_enabled).then_some(sfm_preset.sfm_max_image_size),
-                Some(if state.planner_enabled {
-                    sfm_preset.planned_sfm_max_features
-                } else {
-                    sfm_preset.sfm_max_features
-                }),
-                paths.logs.join("colmap.log"),
-                &self.process_manager,
-                Some(self.process_observer(
+            self.backend
+                .extract_incremental_features(
+                    &self.job_context(
+                        paths.logs.join("colmap.log"),
+                        Some(self.process_observer(
                     PipelineStage::ExtractingFeatures,
-                    PipelineEngine::Colmap,
+                    PipelineComponent::Reconstruction,
                     Some(prepared.image_count),
                     ObserverMode::BracketProgress,
                 )),
-                acceleration.gpu_index(),
-            )
-            .await?;
+                        acceleration.gpu_index(),
+                    ),
+                    IncrementalFeatureExtraction {
+                        base: FeatureExtraction {
+                            database: database.clone(),
+                            images: Path::new("../colmap_frames").to_path_buf(),
+                            image_list: Some(Path::new("reshoot-images.txt").to_path_buf()),
+                            existing_camera_id: Some(provenance.camera_id),
+                            masks: prepared.has_alpha.then(|| Path::new("../reshoot-masks").to_path_buf()),
+                            max_image_size: (!state.planner_enabled).then_some(sfm_preset.sfm_max_image_size),
+                            max_features: Some(if state.planner_enabled { sfm_preset.planned_sfm_max_features } else { sfm_preset.sfm_max_features }),
+                        },
+                    },
+                )
+                .await?;
             checkpoint.supplemental_features_complete = true;
             state.stage = PipelineStage::ExtractingFeatures;
             state.reshoot = Some(checkpoint.clone());
@@ -1843,23 +1914,27 @@ impl PipelineRunner {
         if !checkpoint.incremental_matching_complete {
             self.events
                 .stage(PipelineStage::Matching, 0.0, "正在补充新旧画面之间的联系");
-            colmap::match_exhaustive(
-                &self.engines.colmap,
-                &database,
-                paths.logs.join("colmap.log"),
-                &self.process_manager,
-                Some(self.process_observer(
+            self.backend
+                .match_exhaustive(
+                    &self.job_context(
+                        paths.logs.join("colmap.log"),
+                        Some(self.process_observer(
                     PipelineStage::Matching,
-                    PipelineEngine::Colmap,
+                    PipelineComponent::Reconstruction,
                     Some(prepared.image_count),
                     ObserverMode::Matching,
                 )),
-                acceleration.gpu_index(),
-            )
-            .await?;
+                        acceleration.gpu_index(),
+                    ),
+                    Matching {
+                        database: database.clone(),
+                        loop_detection: false,
+                    },
+                )
+                .await?;
             self.events.send(
                 PipelineStage::Matching,
-                Some(PipelineEngine::Colmap),
+                Some(PipelineComponent::Reconstruction),
                 EventKind::Progress,
                 EventLevel::Info,
                 Some(1.0),
@@ -1902,25 +1977,28 @@ impl PipelineRunner {
                 0.0,
                 "正在把补拍画面注册到原相机重建中",
             );
-            colmap::map_incremental(
-                &self.engines.colmap,
-                &database,
-                Path::new("../colmap_frames"),
-                Path::new("base-model"),
-                &sparse,
-                Path::new("mapper-images.txt"),
-                state.planner_enabled,
-                paths.logs.join("colmap.log"),
-                &self.process_manager,
-                Some(self.process_observer(
+            self.backend
+                .map_incremental(
+                    &self.job_context(
+                        paths.logs.join("colmap.log"),
+                        Some(self.process_observer(
                     PipelineStage::Reconstructing,
-                    PipelineEngine::Colmap,
+                    PipelineComponent::Reconstruction,
                     Some(mapper_names.len() as u64),
                     ObserverMode::Mapper,
                 )),
-                acceleration.gpu_index(),
-            )
-            .await?;
+                        acceleration.gpu_index(),
+                    ),
+                    IncrementalMapping {
+                        database: database.clone(),
+                        images: Path::new("../colmap_frames").to_path_buf(),
+                        input_model: Path::new("base-model").to_path_buf(),
+                        output: sparse.clone(),
+                        image_list: Path::new("mapper-images.txt").to_path_buf(),
+                        automatic_optimization: state.planner_enabled,
+                    },
+                )
+                .await?;
             checkpoint.incremental_reconstruction_complete = true;
             state.stage = PipelineStage::Reconstructing;
             state.reshoot = Some(checkpoint.clone());
@@ -1986,7 +2064,7 @@ impl PipelineRunner {
             project_manager.write_state(&paths.state, &state).await?;
             self.events.send(
                 PipelineStage::TrainingSplats,
-                Some(PipelineEngine::Brush),
+                Some(PipelineComponent::Training),
                 EventKind::Stage,
                 EventLevel::Info,
                 None,
@@ -2076,7 +2154,7 @@ impl PipelineRunner {
         paths: &ProjectPaths,
         metadata: &mut ProjectMetadata,
         mut state: PipelineStateFile,
-        acceleration: &crate::engines::ColmapAccelerationStatus,
+        acceleration: &crate::engines::AccelerationStatus,
     ) -> Result<PipelineResult> {
         let quality = metadata.quality;
         if state.input_type != metadata.input_type {
@@ -2095,13 +2173,13 @@ impl PipelineRunner {
             && state.resolution_plan.is_none()
             && metadata.input_type == ProjectInputType::Video
         {
-            let video = probe_video(
-                &self.engines.ffprobe,
-                &metadata.source_path,
-                Some(paths.logs.join("ffprobe.log")),
-                &self.process_manager,
-            )
-            .await?;
+            let video = self
+                .media
+                .probe_video(
+                    &self.media_context(Some(paths.logs.join("ffprobe.log")), None),
+                    &metadata.source_path,
+                )
+                .await?;
             let (source_width, source_height) = oriented_video_dimensions(&video);
             let resolution = resolve_planner_resolution_plan(
                 quality,
@@ -2205,7 +2283,7 @@ impl PipelineRunner {
         if let Some(resolution) = state.resolution_plan {
             self.events.send(
                 PipelineStage::ExtractingFeatures,
-                Some(PipelineEngine::System),
+                Some(PipelineComponent::System),
                 EventKind::Log,
                 EventLevel::Info,
                 None,
@@ -2256,41 +2334,53 @@ impl PipelineRunner {
             self.events.stage(
                 PipelineStage::ExtractingFeatures,
                 0.0,
-                format!("COLMAP 正在使用 {backend_label} 提取特征"),
+                format!("正在使用 {backend_label} 提取特征"),
             );
             let observer = Some(self.process_observer(
                 PipelineStage::ExtractingFeatures,
-                PipelineEngine::Colmap,
+                PipelineComponent::Reconstruction,
                 Some(prepared.extracted_frames),
                 ObserverMode::BracketProgress,
             ));
             if state.planner_enabled {
-                colmap::extract_features_quality_v2(
-                    &self.engines.colmap,
-                    &database,
-                    colmap_images,
-                    colmap_masks,
-                    None,
-                    sfm_max_image_size,
-                    preset.planned_sfm_max_features,
-                    colmap_log.clone(),
-                    &self.process_manager,
-                    observer,
-                    gpu_index,
+                self.backend
+                .extract_features_quality_v2(
+                    &self.job_context(
+                        colmap_log.clone(),
+                        observer,
+                        gpu_index,
+                    ),
+                    QualityFeatureExtraction {
+                        base: FeatureExtraction {
+                            database: database.clone(),
+                            images: colmap_images.to_path_buf(),
+                            masks: colmap_masks.map(|path| path.to_path_buf()),
+                            image_list: None,
+                            existing_camera_id: None,
+                            max_image_size: Some(sfm_max_image_size),
+                            max_features: Some(preset.planned_sfm_max_features),
+                        },
+                        planned_max_features: preset.planned_sfm_max_features,
+                    },
                 )
                 .await?;
             } else {
-                colmap::extract_features(
-                    &self.engines.colmap,
-                    &database,
-                    colmap_images,
-                    colmap_masks,
-                    Some(sfm_max_image_size),
-                    Some(preset.sfm_max_features),
-                    colmap_log.clone(),
-                    &self.process_manager,
-                    observer,
-                    gpu_index,
+                self.backend
+                .extract_features(
+                    &self.job_context(
+                        colmap_log.clone(),
+                        observer,
+                        gpu_index,
+                    ),
+                    FeatureExtraction {
+                        database: database.clone(),
+                        images: colmap_images.to_path_buf(),
+                        masks: colmap_masks.map(|path| path.to_path_buf()),
+                        image_list: None,
+                        existing_camera_id: None,
+                        max_image_size: Some(sfm_max_image_size),
+                        max_features: Some(preset.sfm_max_features),
+                    },
                 )
                 .await?;
             }
@@ -2321,7 +2411,7 @@ impl PipelineRunner {
                 PipelineStage::Matching,
                 0.0,
                 format!(
-                    "COLMAP 正在进行 {backend_label} {}",
+                    "正在进行 {backend_label} {}",
                     if prepared.input_type == ProjectInputType::Images {
                         "穷举匹配"
                     } else if loop_detection {
@@ -2333,7 +2423,7 @@ impl PipelineRunner {
             );
             let observer = Some(self.process_observer(
                 PipelineStage::Matching,
-                PipelineEngine::Colmap,
+                PipelineComponent::Reconstruction,
                 Some(prepared.extracted_frames),
                 ObserverMode::BracketProgress,
             ));
@@ -2348,14 +2438,17 @@ impl PipelineRunner {
                 )
                 .await?;
             } else {
-                colmap::match_sequential(
-                    &self.engines.colmap,
-                    &database,
-                    colmap_log.clone(),
-                    &self.process_manager,
-                    observer,
-                    gpu_index,
-                    loop_detection,
+                self.backend
+                .match_sequential(
+                    &self.job_context(
+                        colmap_log.clone(),
+                        observer,
+                        gpu_index,
+                    ),
+                    Matching {
+                        database: database.clone(),
+                        loop_detection: loop_detection,
+                    },
                 )
                 .await?;
             }
@@ -2394,24 +2487,28 @@ impl PipelineRunner {
                     "正在增量重建相机轨迹"
                 },
             );
-            colmap::map(
-                &self.engines.colmap,
-                &database,
-                colmap_images,
-                &sparse,
-                allow_two_view_tracks,
-                state.planner_enabled,
-                colmap_log.clone(),
-                &self.process_manager,
-                Some(self.process_observer(
+            self.backend
+                .map_sparse(
+                    &self.job_context(
+                        colmap_log.clone(),
+                        Some(self.process_observer(
                     PipelineStage::Reconstructing,
-                    PipelineEngine::Colmap,
+                    PipelineComponent::Reconstruction,
                     Some(prepared.extracted_frames),
                     ObserverMode::Mapper,
                 )),
-                gpu_index,
-            )
-            .await?;
+                        gpu_index,
+                    ),
+                    SparseMapping {
+                        database: database.clone(),
+                        images: colmap_images.to_path_buf(),
+                        input_model: PathBuf::new(),
+                        output: sparse.clone(),
+                        allow_two_view_tracks: allow_two_view_tracks,
+                        automatic_optimization: state.planner_enabled,
+                    },
+                )
+                .await?;
             state.stage = PipelineStage::Reconstructing;
             state.reconstruction_complete = true;
             project_manager.write_state(&paths.state, &state).await?;
@@ -2587,7 +2684,7 @@ impl PipelineRunner {
             };
             self.events.send(
                 PipelineStage::TrainingSplats,
-                Some(PipelineEngine::Brush),
+                Some(PipelineComponent::Training),
                 EventKind::Stage,
                 EventLevel::Info,
                 None,
@@ -2690,7 +2787,7 @@ impl PipelineRunner {
         paths: &ProjectPaths,
         state: &mut PipelineStateFile,
         quality: Quality,
-        acceleration: &crate::engines::ColmapAccelerationStatus,
+        acceleration: &crate::engines::AccelerationStatus,
         dataset: &Path,
         initial_sfm_points: u64,
         resolved: ResolvedBrushTrainingPreset,
@@ -2700,7 +2797,7 @@ impl PipelineRunner {
         let gpu_launch_policy = brush::BrushGpuLaunchPolicy::from_acceleration(acceleration);
         self.events.send(
             PipelineStage::TrainingSplats,
-            Some(PipelineEngine::Brush),
+            Some(PipelineComponent::Training),
             EventKind::Log,
             EventLevel::Info,
             None,
@@ -2727,7 +2824,7 @@ impl PipelineRunner {
             &self.process_manager,
             Some(self.process_observer(
                 PipelineStage::TrainingSplats,
-                PipelineEngine::Brush,
+                PipelineComponent::Training,
                 Some(resolved.preset.total_steps as u64),
                 ObserverMode::Brush,
             )),
@@ -2758,7 +2855,7 @@ impl PipelineRunner {
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::TrainingSplats,
-                    Some(PipelineEngine::Brush),
+                    Some(PipelineComponent::Training),
                     EventKind::Log,
                     EventLevel::Warning,
                     None,
@@ -2785,7 +2882,7 @@ impl PipelineRunner {
                     &self.process_manager,
                     Some(self.process_observer(
                         PipelineStage::TrainingSplats,
-                        PipelineEngine::Brush,
+                        PipelineComponent::Training,
                         Some(downgraded.preset.total_steps as u64),
                         ObserverMode::Brush,
                     )),
@@ -2805,7 +2902,7 @@ impl PipelineRunner {
         let densification = resolved.preset.densification;
         self.events.send(
             PipelineStage::TrainingSplats,
-            Some(PipelineEngine::Brush),
+            Some(PipelineComponent::Training),
             EventKind::Log,
             level,
             None,
@@ -2914,7 +3011,7 @@ impl PipelineRunner {
                     project_manager.write_state(&paths.state, state).await?;
                     self.events.send(
                         PipelineStage::ValidatingReconstruction,
-                        Some(PipelineEngine::System),
+                        Some(PipelineComponent::System),
                         EventKind::Log,
                         EventLevel::Warning,
                         Some(1.0),
@@ -2941,7 +3038,7 @@ impl PipelineRunner {
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::ValidatingReconstruction,
-                    Some(PipelineEngine::System),
+                    Some(PipelineComponent::System),
                     EventKind::Log,
                     EventLevel::Warning,
                     Some(1.0),
@@ -2981,7 +3078,7 @@ impl PipelineRunner {
             project_manager.write_state(&paths.state, state).await?;
             self.events.send(
                 PipelineStage::ValidatingReconstruction,
-                Some(PipelineEngine::System),
+                Some(PipelineComponent::System),
                 EventKind::Log,
                 EventLevel::Warning,
                 Some(1.0),
@@ -2997,7 +3094,7 @@ impl PipelineRunner {
         if let Some(first) = bridge_plan.selection_trace.first() {
             self.events.send(
                 PipelineStage::ValidatingReconstruction,
-                Some(PipelineEngine::System),
+                Some(PipelineComponent::System),
                 EventKind::Log,
                 EventLevel::Info,
                 Some(0.0),
@@ -3015,7 +3112,7 @@ impl PipelineRunner {
         }
         self.events.send(
             PipelineStage::ValidatingReconstruction,
-            Some(PipelineEngine::System),
+            Some(PipelineComponent::System),
             EventKind::Log,
             EventLevel::Warning,
             Some(0.0),
@@ -3064,7 +3161,7 @@ impl PipelineRunner {
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::ValidatingReconstruction,
-                    Some(PipelineEngine::System),
+                    Some(PipelineComponent::System),
                     EventKind::Log,
                     EventLevel::Info,
                     Some(1.0),
@@ -3123,7 +3220,7 @@ impl PipelineRunner {
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::ValidatingReconstruction,
-                    Some(PipelineEngine::System),
+                    Some(PipelineComponent::System),
                     EventKind::Log,
                     EventLevel::Warning,
                     Some(1.0),
@@ -3163,25 +3260,31 @@ impl PipelineRunner {
             0.0,
             format!("Bridge Backfill 正在提取 {} 张新增帧", additional.len()),
         );
-        let extraction = extract_additional_frames(
-            &self.engines.ffmpeg,
-            &metadata.source_path,
-            &paths.frames,
-            &paths.colmap_frames,
-            &paths.masks,
-            additional,
-            prepared.has_alpha,
-            Some((prepared.working_width, prepared.working_height)),
-            Some(paths.logs.join("ffmpeg-bridge.log")),
-            &self.process_manager,
-            Some(self.process_observer(
-                PipelineStage::ValidatingReconstruction,
-                PipelineEngine::Ffmpeg,
-                Some(additional.len() as u64),
-                ObserverMode::Ffmpeg,
-            )),
-        )
-        .await?;
+        let extraction = self
+            .media
+            .extract_additional_frames(
+                &self.media_context(
+                    Some(paths.logs.join("ffmpeg-bridge.log")),
+                    Some(self.process_observer(
+                        PipelineStage::ValidatingReconstruction,
+                        PipelineComponent::Media,
+                        Some(additional.len() as u64),
+                        ObserverMode::Ffmpeg,
+                    )),
+                ),
+                crate::media::SelectedFrameExtraction {
+                    base: crate::media::FrameExtraction {
+                        input: metadata.source_path.clone(),
+                        output_directory: paths.frames.clone(),
+                        colmap_directory: paths.colmap_frames.clone(),
+                        mask_directory: paths.masks.clone(),
+                        has_alpha: prepared.has_alpha,
+                        target_dimensions: Some((prepared.working_width, prepared.working_height)),
+                    },
+                    selected_frames: additional.to_vec(),
+                },
+            )
+            .await?;
         for frame in additional {
             if !prepared
                 .plan
@@ -3248,7 +3351,7 @@ impl PipelineRunner {
             &self.process_manager,
             Some(self.process_observer(
                 PipelineStage::ValidatingReconstruction,
-                PipelineEngine::Colmap,
+                PipelineComponent::Reconstruction,
                 Some(additional.len() as u64),
                 ObserverMode::BracketProgress,
             )),
@@ -3279,21 +3382,24 @@ impl PipelineRunner {
             0.0,
             format!("Bridge Backfill 正在匹配 {pair_count} 组局部帧对"),
         );
-        colmap::match_pairs(
-            &self.engines.colmap,
-            database,
-            &pair_list,
-            paths.logs.join("colmap-bridge-matching.log"),
-            &self.process_manager,
-            Some(self.process_observer(
+        self.backend
+                .match_pairs(
+                    &self.job_context(
+                        paths.logs.join("colmap-bridge-matching.log"),
+                        Some(self.process_observer(
                 PipelineStage::ValidatingReconstruction,
-                PipelineEngine::Colmap,
+                PipelineComponent::Reconstruction,
                 Some(pair_count as u64),
                 ObserverMode::BracketProgress,
             )),
-            gpu_index,
-        )
-        .await?;
+                        gpu_index,
+                    ),
+                    PairMatching {
+                        database: database.to_path_buf(),
+                        pair_list: pair_list.clone(),
+                    },
+                )
+                .await?;
 
         let bridge_sparse = paths.colmap.join("sparse-bridge");
         reset_directory(&bridge_sparse).await?;
@@ -3305,24 +3411,28 @@ impl PipelineRunner {
         let input_model = initial_model
             .strip_prefix(&paths.colmap)
             .unwrap_or(initial_model);
-        colmap::map_from_existing(
-            &self.engines.colmap,
-            database,
-            colmap_images,
-            input_model,
-            &bridge_sparse,
-            state.planner_enabled,
-            colmap_log.with_file_name("colmap-bridge-mapper.log"),
-            &self.process_manager,
-            Some(self.process_observer(
+        self.backend
+                .map_from_existing(
+                    &self.job_context(
+                        colmap_log.with_file_name("colmap-bridge-mapper.log"),
+                        Some(self.process_observer(
                 PipelineStage::ValidatingReconstruction,
-                PipelineEngine::Colmap,
+                PipelineComponent::Reconstruction,
                 Some(prepared.extracted_frames),
                 ObserverMode::Mapper,
             )),
-            gpu_index,
-        )
-        .await?;
+                        gpu_index,
+                    ),
+                    SparseMapping {
+                        database: database.to_path_buf(),
+                        images: colmap_images.to_path_buf(),
+                        input_model: input_model.to_path_buf(),
+                        output: bridge_sparse.clone(),
+                        allow_two_view_tracks: false,
+                        automatic_optimization: state.planner_enabled,
+                    },
+                )
+                .await?;
         let (model, report) =
             best_sparse_model_with_input_count(&bridge_sparse, prepared.extracted_frames).await?;
         if report.registered_images < initial_report.registered_images {
@@ -3337,7 +3447,7 @@ impl PipelineRunner {
     fn process_observer(
         &self,
         stage: PipelineStage,
-        engine: PipelineEngine,
+        component: PipelineComponent,
         expected_total: Option<u64>,
         mode: ObserverMode,
     ) -> ProcessObserver {
@@ -3355,10 +3465,10 @@ impl PipelineRunner {
                 if mode != ObserverMode::Brush {
                     tracker.snapshot.phase = "running".into();
                 }
-                events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                events.runtime(stage, component, tracker.refresh(Instant::now()));
                 events.send(
                     stage,
-                    Some(engine),
+                    Some(component),
                     EventKind::Log,
                     EventLevel::Info,
                     None,
@@ -3377,13 +3487,13 @@ impl PipelineRunner {
                     return;
                 }
                 tracker.snapshot.resources = Some(sample);
-                events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                events.runtime(stage, component, tracker.refresh(Instant::now()));
             }
             ProcessUpdate::Heartbeat { elapsed_ms } => {
                 let mut tracker = runtime
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                events.runtime(stage, component, tracker.refresh(Instant::now()));
                 if mode == ObserverMode::Matching {
                     let bucket = elapsed_ms / 10_000;
                     if bucket > 0
@@ -3391,7 +3501,7 @@ impl PipelineRunner {
                     {
                         events.send(
                             stage,
-                            Some(engine),
+                            Some(component),
                             EventKind::Heartbeat,
                             EventLevel::Info,
                             None,
@@ -3415,14 +3525,14 @@ impl PipelineRunner {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     tracker.snapshot.phase = phase.into();
-                    events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                    events.runtime(stage, component, tracker.refresh(Instant::now()));
                 }
                 let progress = total
                     .filter(|value| *value > 0)
                     .map(|value| current as f32 / value as f32);
                 events.send(
                     stage,
-                    Some(engine),
+                    Some(component),
                     EventKind::Progress,
                     EventLevel::Info,
                     progress,
@@ -3443,7 +3553,7 @@ impl PipelineRunner {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let actual = tracker.line(&line, Instant::now(), brush);
-                    events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                    events.runtime(stage, component, tracker.refresh(Instant::now()));
                     actual
                 };
                 let parsed = match mode {
@@ -3476,7 +3586,7 @@ impl PipelineRunner {
                         .map(|value| current as f32 / value as f32);
                     events.send(
                         stage,
-                        Some(engine),
+                        Some(component),
                         EventKind::Progress,
                         EventLevel::Info,
                         progress.map(|value| if brush { value.min(0.99) } else { value }),
@@ -3489,7 +3599,7 @@ impl PipelineRunner {
                 } else if mode == ObserverMode::Brush {
                     events.send(
                         stage,
-                        Some(engine),
+                        Some(component),
                         EventKind::Log,
                         if line.contains(" WARN ") {
                             EventLevel::Warning
@@ -3511,7 +3621,7 @@ impl PipelineRunner {
                 } else if is_useful_line(&line) {
                     events.send(
                         stage,
-                        Some(engine),
+                        Some(component),
                         EventKind::Log,
                         EventLevel::Info,
                         None,
@@ -5626,7 +5736,7 @@ mod tests {
         );
         let observer = runner.process_observer(
             PipelineStage::TrainingSplats,
-            PipelineEngine::Brush,
+            PipelineComponent::Training,
             Some(100),
             ObserverMode::Brush,
         );
@@ -5652,7 +5762,7 @@ mod tests {
         );
         let observer = runner.process_observer(
             PipelineStage::TrainingSplats,
-            PipelineEngine::Brush,
+            PipelineComponent::Training,
             Some(100),
             ObserverMode::Brush,
         );
@@ -5689,7 +5799,7 @@ mod tests {
 
         let retry = runner.process_observer(
             PipelineStage::TrainingSplats,
-            PipelineEngine::Brush,
+            PipelineComponent::Training,
             Some(100),
             ObserverMode::Brush,
         );

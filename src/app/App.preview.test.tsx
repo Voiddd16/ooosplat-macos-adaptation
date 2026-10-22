@@ -48,8 +48,8 @@ vi.mock("../lib/backend", () => ({
   cancelPipeline: mocks.cancelPipeline,
   prepareErrorReport: mocks.prepareErrorReport,
   sendErrorReport: mocks.sendErrorReport,
-  checkEngines: vi.fn().mockResolvedValue([]),
-  checkColmapAcceleration: vi.fn().mockResolvedValue(null),
+  checkComponents: vi.fn().mockResolvedValue([]),
+  getAcceleration: vi.fn().mockResolvedValue(null),
   classifyDroppedInput: mocks.classifyDroppedInput,
   confirmAndDeleteProject: vi.fn().mockResolvedValue(false),
   confirmLargeImageSequence: mocks.confirmLargeImageSequence,
@@ -135,8 +135,8 @@ describe("App preview workspace", () => {
     mocks.getSharedTasks.mockReset().mockResolvedValue([]);
     mocks.onTaskUpdate.mockReset().mockResolvedValue(() => undefined);
     useAppStore.setState({
-      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null,
-      video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
+      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", projects: [], quality: "balanced", acceleration: null, taskAcceleration: null,
+      video: null, imageSequence: null, plan: null, estimate: null, components: [], phase: "idle", progress: 0, progressMessage: "",
       latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], liveTask: null, result: null, error: null, errorAt: null,
     });
     mocks.prepareGaussianPreview.mockReset();
@@ -879,7 +879,7 @@ describe("App preview workspace", () => {
     await flush();
 
     expect(container.textContent).toContain("检测到 Alpha 通道");
-    expect(container.textContent).toContain("将自动提取透明画面和 COLMAP Mask");
+    expect(container.textContent).toContain("将自动提取透明画面和 掩膜");
 
     mocks.selectVideo.mockResolvedValueOnce("E:\\Media\\opaque.mp4");
     mocks.probeAndPlan.mockResolvedValueOnce({
@@ -901,7 +901,7 @@ describe("App preview workspace", () => {
     });
     await act(async () => { container.querySelector<HTMLButtonElement>(".input-picker > .path-picker")?.click(); });
     await flush();
-    expect(container.textContent).not.toContain("将自动提取透明画面和 COLMAP Mask");
+    expect(container.textContent).not.toContain("将自动提取透明画面和 掩膜");
   });
 
   it("hides the previous live process after selecting new media but keeps new analysis notices", async () => {
@@ -914,12 +914,12 @@ describe("App preview workspace", () => {
       progressMessage: "old task output",
       latestEvent: {
         sequence: 1, timestamp: new Date().toISOString(), kind: "log", level: "error", stage: "failed",
-        engine: "system", progress: 64, stageProgress: null, indeterminate: false, message: "old task output",
+        component: "system", progress: 64, stageProgress: null, indeterminate: false, message: "old task output",
         current: null, total: null, unit: null, elapsedMs: 1_000, acceleration: null,
       },
       events: [{
         sequence: 1, timestamp: new Date().toISOString(), kind: "log", level: "error", stage: "failed",
-        engine: "system", progress: 64, stageProgress: null, indeterminate: false, message: "old task output",
+        component: "system", progress: 64, stageProgress: null, indeterminate: false, message: "old task output",
         current: null, total: null, unit: null, elapsedMs: 1_000, acceleration: null,
       }],
     }));
@@ -948,7 +948,7 @@ describe("App preview workspace", () => {
     act(() => useAppStore.setState({
       events: [{
         sequence: 1, timestamp: new Date().toISOString(), kind: "log", level: "info", stage: "completed",
-        engine: "system", progress: 100, stageProgress: 100, indeterminate: false, message: "old completed log",
+        component: "system", progress: 100, stageProgress: 100, indeterminate: false, message: "old completed log",
         current: null, total: null, unit: null, elapsedMs: 1_000, acceleration: null,
       }],
     }));
@@ -996,8 +996,8 @@ describe("App preview workspace", () => {
       code: "pipeline_failed",
       message: "Could not find a good initial image pair",
       failedStage: "reconstructing",
-      engine: "colmap",
-      failureKind: "mapper_source",
+      component: "reconstruction",
+      failureKind: "reconstructionInput",
       projectId: project.id,
     });
     await act(async () => { useAppStore.setState({ projects: [unfinished] }); });
@@ -1008,7 +1008,7 @@ describe("App preview workspace", () => {
 
     const dialog = container.querySelector<HTMLElement>(".failure-guidance-dialog");
     expect(dialog).not.toBeNull();
-    expect(dialog?.textContent).toContain("COLMAP");
+    expect(dialog?.textContent).toContain("重建引擎");
     expect(dialog?.textContent).toContain("Could not find a good initial image pair");
 
     await act(async () => { dialog?.querySelector<HTMLButtonElement>("button.secondary")?.click(); });
@@ -1026,8 +1026,8 @@ describe("App preview workspace", () => {
       code: "pipeline_failed",
       message: "IO error while loading dataset: early eof",
       failedStage: "trainingSplats",
-      engine: "brush",
-      failureKind: "brush_dataset",
+      component: "training",
+      failureKind: "trainingDataset",
       projectId: project.id,
     });
     await act(async () => { useAppStore.setState({ projects: [unfinished] }); });
@@ -1055,7 +1055,7 @@ describe("App preview workspace", () => {
   it("offers voluntary reporting for a generic failure even with analytics off", async () => {
     mocks.initializeTelemetry.mockResolvedValue({ analyticsEnabled: false, consentDecided: true, deliveryStatus: "configured" });
     await act(async () => { root.render(<LanguageProvider><App key="analytics-disabled" /></LanguageProvider>); }); await flush();
-    mocks.resumePipeline.mockRejectedValueOnce({ code: "pipeline_failed", message: "engine failed", failedStage: "matching", engine: "colmap", projectId: project.id, failureId: "failure-token" });
+    mocks.resumePipeline.mockRejectedValueOnce({ code: "pipeline_failed", message: "engine failed", failedStage: "matching", component: "reconstruction", projectId: project.id, failureId: "failure-token" });
     await act(async () => { useAppStore.setState({ projects: [{ ...project, status: "failed", finalPly: null }] }); });
     await act(async () => { [...container.querySelectorAll("button")].find(button => button.textContent === "继续任务")?.click(); }); await flush();
     const report = [...container.querySelectorAll("button")].find(button => button.textContent === "发送错误报告");
@@ -1130,7 +1130,7 @@ describe("App preview workspace", () => {
         kind: "heartbeat",
         level: "info",
         stage: "trainingSplats",
-        engine: "brush",
+        component: "training",
         progress: 79,
         stageProgress: 50,
         indeterminate: false,
@@ -1485,14 +1485,14 @@ describe("App preview workspace", () => {
       sourceProjectId: null,
       logs: [],
     });
-    await act(async () => useAppStore.getState().setColmapAcceleration({
-      backend: "gpu",
-      detectionState: "ready",
+    await act(async () => useAppStore.getState().setAcceleration({
+      mode: "gpu",
+      state: "ready",
       reasonCode: "gpuReady",
       reason: "NVIDIA GeForce RTX 3060 Ti",
       device: { index: 0, name: "NVIDIA GeForce RTX 3060 Ti", driverVersion: "616.92", computeCapability: "8.6", totalMemoryMb: 8192 },
       requirements: { minimumDriverVersion: "580.00", minimumComputeCapability: "7.5" },
-      detectedNvidiaDeviceCount: 1,
+      detectedDeviceCount: 1,
     }));
     await act(async () => { container.querySelector<HTMLElement>(".project-group:not(.new-task-group):not(.unfinished) .project-row")?.click(); });
     await flush();
@@ -1506,9 +1506,9 @@ describe("App preview workspace", () => {
     expect(detail?.querySelector(".locked-quality-settings [aria-checked=true]")?.textContent).toContain("均衡");
     expect(detail?.querySelector<HTMLButtonElement>(".planner-switch")?.disabled).toBe(true);
     expect(detail?.querySelector(".locked-setting")).toBeNull();
-    expect(detail?.textContent).toContain("COLMAP GPU 加速开启");
-    expect(detail?.textContent).not.toContain("COLMAP GPU 加速已开启");
-    expect(detail?.textContent).toContain("已自动提取透明画面和 COLMAP Mask · rgba");
+    expect(detail?.textContent).toContain("GPU 加速开启");
+    expect(detail?.textContent).not.toContain("GPU 加速已开启");
+    expect(detail?.textContent).toContain("已自动提取透明画面和 掩膜 · rgba");
     expect(detail?.querySelectorAll(".project-source-metrics > span")).toHaveLength(2);
     expect(detail?.querySelector(".project-source-metrics")?.textContent).not.toContain("预计帧数");
     expect(detail?.querySelector(".primary-action")).toBeNull();

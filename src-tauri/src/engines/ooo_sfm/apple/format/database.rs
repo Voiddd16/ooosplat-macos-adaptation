@@ -283,6 +283,11 @@ CREATE TABLE IF NOT EXISTS two_view_geometries
     tvec     BLOB,
     camera1  BLOB,
     camera2  BLOB);
+CREATE TABLE IF NOT EXISTS feature_colors
+   (image_id  INTEGER  PRIMARY KEY  NOT NULL,
+    rows      INTEGER               NOT NULL,
+    data      BLOB,
+    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE);
 "#,
             max_images = MAX_NUM_IMAGES
         ))
@@ -443,6 +448,23 @@ pub fn has_keypoints_and_descriptors(connection: &Connection, image_id: u32) -> 
     Ok(count == 2)
 }
 
+/// 特征是否完整：`keypoints` + `descriptors` 都在，且 `feature_colors` 行
+/// 与 keypoints 行数一致（旧版数据库只有前两者 → 判为不完整以触发重提）。
+pub fn has_complete_features(connection: &Connection, image_id: u32) -> Result<bool> {
+    if !has_keypoints_and_descriptors(connection, image_id)? {
+        return Ok(false);
+    }
+    let colors = read_feature_colors(connection, image_id)?;
+    let rows: i64 = connection
+        .query_row(
+            "SELECT rows FROM keypoints WHERE image_id = ?1",
+            [image_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    Ok(colors.len() == rows as usize)
+}
+
 /// 删除某图像的特征（重新提取用；COLMAP 靠主键冲突暴露半成品状态，这里更稳）。
 pub fn delete_features(connection: &Connection, image_id: u32) -> Result<()> {
     connection
@@ -475,6 +497,61 @@ pub fn write_keypoints(connection: &Connection, image_id: u32, keypoints: &[Keyp
         )
         .map_err(sqlite)?;
     Ok(())
+}
+
+/// `feature_colors` 表：每个特征点的观测颜色（行主序 3 字节 RGB，
+/// 行数与 `keypoints` 一致），供三角化时合成 `points3D.color`。
+pub fn write_feature_colors(connection: &Connection, image_id: u32, colors: &[[u8; 3]]) -> Result<()> {
+    if colors.is_empty() {
+        return Ok(());
+    }
+    let mut data = Vec::with_capacity(colors.len() * 3);
+    for color in colors {
+        data.extend_from_slice(color);
+    }
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO feature_colors(image_id, rows, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![image_id, colors.len() as i64, data],
+        )
+        .map_err(sqlite)?;
+    Ok(())
+}
+
+/// 读一张图像的特征点颜色；旧版数据库没有 `feature_colors` 表时返回空。
+pub fn read_feature_colors(connection: &Connection, image_id: u32) -> Result<Vec<[u8; 3]>> {
+    let present: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'feature_colors')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite)?
+        != 0;
+    if !present {
+        return Ok(Vec::new());
+    }
+    let (rows, data): (i64, Vec<u8>) = match connection.query_row(
+        "SELECT rows, data FROM feature_colors WHERE image_id = ?1",
+        [image_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(pair) => pair,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+        Err(error) => return Err(sqlite(error)),
+    };
+    let expected = rows as usize * 3;
+    if data.len() != expected {
+        return Err(SplatError::Process(format!(
+            "feature_colors 数据长度 {} 与行数 {rows} 不符",
+            data.len()
+        )));
+    }
+    let mut colors = Vec::with_capacity(rows as usize);
+    for chunk in data.chunks_exact(3) {
+        colors.push([chunk[0], chunk[1], chunk[2]]);
+    }
+    Ok(colors)
 }
 
 /// `descriptors` 表；`data` 是行主序的 `rows × 128` 的 `u8`。

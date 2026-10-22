@@ -28,7 +28,7 @@ describe("App update notifications", () => {
     localStorage.clear(); localStorage.setItem("ooo-splat-language", "zh-CN");
     mocks.check.mockReset().mockResolvedValue(update);
     mocks.telemetry.mockReset().mockResolvedValue({ analyticsEnabled: false, consentDecided: true, deliveryStatus: "configured" });
-    useAppStore.setState({ phase: "idle", engines: [], projects: [], events: [], error: null, latestEvent: null, liveTask: null });
+    useAppStore.setState({ phase: "idle", components: [], projects: [], events: [], error: null, latestEvent: null, liveTask: null });
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
   afterEach(async () => { await act(async () => root.unmount()); container.remove(); localStorage.clear(); });

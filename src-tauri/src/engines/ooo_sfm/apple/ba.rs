@@ -15,6 +15,7 @@
 //! 支持相机模型：SIMPLE_PINHOLE(0) / PINHOLE(1) / SIMPLE_RADIAL(2) / RADIAL(3)；
 //! 主链路只产出 SIMPLE_RADIAL，其余为兼容读入而保留。
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use super::linalg::{
@@ -503,45 +504,57 @@ fn linearize(
     options: &BaOptions,
     model_ids: &[Option<CameraModelId>],
 ) -> Linearized {
-    let mut jacobians = Vec::new();
-    let mut groups = Vec::with_capacity(points.len());
-    for point in points {
-        let first = jacobians.len();
-        for &(image_row, x, y) in &point.observations {
-            let image = &images[image_row];
-            let camera_row = image.camera;
-            let camera = &cameras[camera_row];
-            let model = model_ids[camera_row].expect("模型已在外层校验");
+    // CPU 加速：按点并行线性化。每个点产出一段独立的小 Vec，最后按原顺序拼接 ——
+    // 输出与串行版本**逐位相同**（BA 的确定性/收敛不受影响）。
+    let per_point: Vec<Vec<ObsJacobian>> = points
+        .par_iter()
+        .map(|point| {
+            let mut chunk = Vec::with_capacity(point.observations.len());
+            for &(image_row, x, y) in &point.observations {
+                let image = &images[image_row];
+                let camera_row = image.camera;
+                let camera = &cameras[camera_row];
+                let model = model_ids[camera_row].expect("模型已在外层校验");
 
-            let rotation = quaternion_to_rotation_matrix(&image.qvec);
-            let px = point.xyz;
-            let u = [
-                rotation[0][0] * px[0] + rotation[0][1] * px[1] + rotation[0][2] * px[2]
-                    + image.tvec[0],
-                rotation[1][0] * px[0] + rotation[1][1] * px[1] + rotation[1][2] * px[2]
-                    + image.tvec[1],
-                rotation[2][0] * px[0] + rotation[2][1] * px[1] + rotation[2][2] * px[2]
-                    + image.tvec[2],
-            ];
-            let (projection, dp_du, focal_columns, pp_columns, extra_columns) =
-                project(model, &camera.params, u);
-            let ex = projection[0] - x;
-            let ey = projection[1] - y;
-            let (_, drho) = options.loss.evaluate(ex * ex + ey * ey);
-            let weight = drho.sqrt();
-            jacobians.push(ObsJacobian {
-                image: image_row,
-                camera: camera_row,
-                dp_du,
-                u: [u[0], u[1], u[2].max(MIN_DEPTH)],
-                rotation,
-                focal_columns,
-                extra_columns,
-                pp_columns,
-                residual: [weight * ex, weight * ey],
-                weight,
-            });
-        }
+                let rotation = quaternion_to_rotation_matrix(&image.qvec);
+                let px = point.xyz;
+                let u = [
+                    rotation[0][0] * px[0] + rotation[0][1] * px[1] + rotation[0][2] * px[2]
+                        + image.tvec[0],
+                    rotation[1][0] * px[0] + rotation[1][1] * px[1] + rotation[1][2] * px[2]
+                        + image.tvec[1],
+                    rotation[2][0] * px[0] + rotation[2][1] * px[1] + rotation[2][2] * px[2]
+                        + image.tvec[2],
+                ];
+                let (projection, dp_du, focal_columns, pp_columns, extra_columns) =
+                    project(model, &camera.params, u);
+                let ex = projection[0] - x;
+                let ey = projection[1] - y;
+                let (_, drho) = options.loss.evaluate(ex * ex + ey * ey);
+                let weight = drho.sqrt();
+                chunk.push(ObsJacobian {
+                    image: image_row,
+                    camera: camera_row,
+                    dp_du,
+                    u: [u[0], u[1], u[2].max(MIN_DEPTH)],
+                    rotation,
+                    focal_columns,
+                    extra_columns,
+                    pp_columns,
+                    residual: [weight * ex, weight * ey],
+                    weight,
+                });
+            }
+            chunk
+        })
+        .collect();
+    let total: usize = per_point.iter().map(Vec::len).sum();
+    let mut jacobians = Vec::with_capacity(total);
+    let mut groups = Vec::with_capacity(points.len());
+    for chunk in per_point {
+        let first = jacobians.len();
+        // `ObsJacobian` 不实现 `Clone`，用移动式追加（输出与串行版逐位相同）。
+        jacobians.append(&mut { chunk });
         groups.push((first, jacobians.len()));
     }
     Linearized { jacobians, groups }
@@ -555,23 +568,62 @@ fn robust_cost(
     loss: Loss,
     model_ids: &[Option<CameraModelId>],
 ) -> f64 {
+    // GPU（`ooo-sfm-metal` feature，默认关闭）：投影批量上 Metal（`apple/gpu.rs`），
+    // 鲁棒代价仍在 CPU 上按**原观测顺序**求和 —— 求和顺序不变，LM 的收敛行为与
+    // CPU 版一致。观测数不足一个 dispatch 时内核返回 `None`，自动回退标量循环。
+    let flat: Vec<(&BaPoint, usize, f64, f64)> = points
+        .iter()
+        .flat_map(|point| {
+            point
+                .observations
+                .iter()
+                .map(move |&observation| (point, observation.0, observation.1, observation.2))
+        })
+        .collect();
+    let mut batch = super::gpu::ProjectionBatch::with_capacity(flat.len());
+    for (point, image_row, _, _) in &flat {
+        let image = &images[*image_row];
+        let model = model_ids[image.camera].expect("模型已在外层校验");
+        batch.push(
+            model,
+            &cameras[image.camera].params,
+            &quaternion_to_rotation_matrix(&image.qvec),
+            &image.tvec,
+            point.xyz,
+        );
+    }
+    let projections = super::gpu::project_points_or(&batch, |slot| {
+        let (point, image_row, _, _) = flat[slot];
+        let image = &images[image_row];
+        let model = model_ids[image.camera].expect("模型已在外层校验");
+        Some(project_point(
+            &image.qvec,
+            &image.tvec,
+            &point.xyz,
+            model,
+            &cameras[image.camera].params,
+        ))
+    });
     let mut total = 0.0;
-    for point in points {
-        for &(image_row, x, y) in &point.observations {
-            let image = &images[image_row];
-            let model = model_ids[image.camera].expect("模型已在外层校验");
-            let projection = project_point(
-                &image.qvec,
-                &image.tvec,
-                &point.xyz,
-                model,
-                &cameras[image.camera].params,
-            );
-            let ex = projection[0] - x;
-            let ey = projection[1] - y;
-            let (rho, _) = loss.evaluate(ex * ex + ey * ey);
-            total += rho;
-        }
+    for (slot, (point, image_row, x, y)) in flat.iter().enumerate() {
+        let projection = match projections.get(slot).copied().flatten() {
+            Some(projection) => projection,
+            None => {
+                let image = &images[*image_row];
+                let model = model_ids[image.camera].expect("模型已在外层校验");
+                project_point(
+                    &image.qvec,
+                    &image.tvec,
+                    &point.xyz,
+                    model,
+                    &cameras[image.camera].params,
+                )
+            }
+        };
+        let ex = projection[0] - x;
+        let ey = projection[1] - y;
+        let (rho, _) = loss.evaluate(ex * ex + ey * ey);
+        total += rho;
     }
     total
 }

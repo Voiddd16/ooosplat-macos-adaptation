@@ -16,12 +16,12 @@ function Harness() {
 
 describe("interface language", () => {
   it("localizes optional loop detection messages without relabeling exhaustive matching", () => {
-    expect(localizePipelineMessage("en", "COLMAP 正在进行 GPU 顺序匹配（已开启闭环检测）")).toBe("COLMAP is running sequential matching with GPU (loop detection enabled)");
+    expect(localizePipelineMessage("en", "正在进行 GPU 顺序匹配（已开启闭环检测）")).toBe("Running sequential matching with GPU (loop detection enabled)");
     expect(localizePipelineMessage("en", "顺序匹配（已开启闭环检测）完成")).toBe("Sequential matching (loop detection enabled) completed");
-    expect(localizePipelineMessage("en", "COLMAP 正在进行 CPU 穷举匹配")).toBe("COLMAP is running exhaustive matching with CPU");
+    expect(localizePipelineMessage("en", "正在进行 CPU 穷举匹配")).toBe("Running exhaustive matching with CPU");
     expect(localizePipelineMessage("en", "闭环检测所需的辅助文件缺失或损坏。请重新安装 OOOSplat，或关闭自动优化后重试。\nSHA256 mismatch")).toContain("Reinstall OOOSplat, or turn off Auto Optimize");
     expect(localizePipelineMessage("en", "外部进程执行失败：闭环检测所需的辅助文件缺失或损坏。请重新安装 OOOSplat，或关闭自动优化后重试。\nSHA256 mismatch")).toContain("Reinstall OOOSplat, or turn off Auto Optimize");
-    expect(localizePipelineMessage("zh-CN", "COLMAP 正在进行 GPU 顺序匹配（已开启闭环检测）")).toContain("已开启闭环检测");
+    expect(localizePipelineMessage("zh-CN", "正在进行 GPU 顺序匹配（已开启闭环检测）")).toContain("已开启闭环检测");
   });
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;

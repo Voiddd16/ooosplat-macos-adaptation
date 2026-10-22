@@ -149,7 +149,7 @@ impl Rng {
         Self::new(self.state.rotate_left(17) ^ salt.wrapping_mul(0xbf58_476d_1ce4_e5b9))
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
@@ -161,6 +161,12 @@ impl Rng {
     /// `[0, 1)` 的均匀实数。
     fn next_f64(&mut self) -> f64 {
         ((self.next_u64() >> 11) as f64) * (1.0 / (1u64 << 53) as f64)
+    }
+
+    /// `[0, n)` 的均匀整数（映射到 `[0, n-1]`）。
+    pub(crate) fn range(&mut self, n: usize) -> usize {
+        debug_assert!(n > 0);
+        self.uniform_index(0, n - 1)
     }
 
     /// `[min, max]` 的均匀整数（对应 `RandomUniformInteger`）。

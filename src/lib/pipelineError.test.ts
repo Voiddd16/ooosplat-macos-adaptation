@@ -21,14 +21,14 @@ describe("pipeline command errors", () => {
       code: "pipeline_failed",
       message: "IO error while loading dataset: early eof",
       failedStage: "trainingSplats",
-      engine: "brush",
-      failureKind: "brush_dataset",
+      component: "training",
+      failureKind: "trainingDataset",
       projectId: "11111111-1111-1111-1111-111111111111",
       logsDirectory: "E:\\Projects\\scene\\logs",
     })).toMatchObject({
       failedStage: "trainingSplats",
-      engine: "brush",
-      failureKind: "brush_dataset",
+      component: "training",
+      failureKind: "trainingDataset",
       projectId: "11111111-1111-1111-1111-111111111111",
     });
   });
@@ -38,9 +38,9 @@ describe("pipeline command errors", () => {
       code: "pipeline_failed",
       message: "VK_ERROR_DEVICE_LOST",
       failedStage: "trainingSplats",
-      engine: "brush",
-      failureKind: "brush_device_lost",
-    })?.failureKind).toBe("brush_device_lost");
+      component: "training",
+      failureKind: "trainingDeviceLost",
+    })?.failureKind).toBe("trainingDeviceLost");
   });
 
   it("drops unknown engines and failure kinds", () => {

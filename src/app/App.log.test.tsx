@@ -17,8 +17,8 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../lib/backend", () => ({
   cancelPipeline: vi.fn(),
-  checkEngines: vi.fn().mockResolvedValue([]),
-  checkColmapAcceleration: vi.fn().mockResolvedValue(null),
+  checkComponents: vi.fn().mockResolvedValue([]),
+  getAcceleration: vi.fn().mockResolvedValue(null),
   confirmAndDeleteProject: vi.fn().mockResolvedValue(false),
   confirmLargeImageSequence: vi.fn().mockResolvedValue(true),
   confirmSmallImageSequence: vi.fn().mockResolvedValue(true),
@@ -59,7 +59,7 @@ const event = (sequence: number): PipelineEvent => ({
   kind: "progress",
   level: "info",
   stage: "trainingSplats",
-  engine: "brush",
+  component: "training",
   progress: 50,
   stageProgress: 50,
   indeterminate: false,
@@ -95,8 +95,8 @@ describe("App live log", () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     window.localStorage.setItem("ooo-splat-language", "zh-CN");
     useAppStore.setState({
-      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null,
-      video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "running", progress: 0, progressMessage: "",
+      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", acceleration: null, taskAcceleration: null,
+      video: null, imageSequence: null, plan: null, estimate: null, components: [], phase: "running", progress: 0, progressMessage: "",
       latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], liveTask: null, result: null, error: null, errorAt: null,
     });
     mocks.getSharedTasks.mockReset().mockResolvedValue([]);
@@ -410,7 +410,7 @@ describe("App live log", () => {
     await act(async () => container.querySelector<HTMLElement>('[data-task-id="agent-task"]')!.click());
     expect(container.querySelector(".shared-task-detail")?.textContent).toContain("orbit.mp4");
     await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 2, status: "running" }, events: [], dropped_event_count: 0 }));
-    await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 3, status: "failed", stage: "failed", error: { code: "pipeline_failed", message: "模型校验失败", failed_stage: "trainingSplats", engine: "brush", exit_code: 2, failure_id: null, classification: "brush_gpu", classification_is_heuristic: true } }, events: [], dropped_event_count: 0 }));
+    await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 3, status: "failed", stage: "failed", error: { code: "pipeline_failed", message: "模型校验失败", failed_stage: "trainingSplats", component: "training", exit_code: 2, failure_id: null, classification: "brush_gpu", classification_is_heuristic: true } }, events: [], dropped_event_count: 0 }));
     expect(container.querySelector(".shared-task-detail")?.textContent).toContain("失败");
     expect(container.querySelector(".shared-task-detail")?.textContent).toContain("模型校验失败");
     expect(container.querySelector('.unfinished [data-task-id="agent-task"]')?.textContent).toContain("失败");

@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
+import type { AppRuntimeStatus, AppSettings, AccelerationStatus, ComponentStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
 import type { ErrorReportDraft, ErrorReportReceipt } from "../types/diagnostics";
 import { getCurrentLocale, translate } from "../i18n";
@@ -71,8 +71,8 @@ export async function selectProjectsRoot(current: string): Promise<string | null
   return typeof selected === "string" ? selected : null;
 }
 
-export async function checkEngines(): Promise<EngineStatus[]> { return inTauri() ? invoke("check_engines") : []; }
-export async function checkColmapAcceleration(): Promise<ColmapAccelerationStatus | null> { return inTauri() ? invoke("check_colmap_acceleration") : null; }
+export async function checkComponents(): Promise<ComponentStatus[]> { return inTauri() ? invoke("check_components") : []; }
+export async function getAcceleration(): Promise<AccelerationStatus | null> { return inTauri() ? invoke("get_acceleration") : null; }
 export async function probeAndPlan(path: string, quality: Quality, plannerEnabled = true): Promise<ProbeAndPlan> { return invoke("probe_and_plan", { path, quality, plannerEnabled }); }
 export async function estimateProjectRuntime(projectId: string): Promise<RuntimeEstimate> { return invoke("estimate_project_runtime", { projectId }); }
 export async function getProjectOverview(): Promise<ProjectOverview> { return invoke("get_project_overview"); }
@@ -231,7 +231,7 @@ async function waitForSharedTask(taskId: string): Promise<PipelineResult> {
         revision = task.revision;
         if (taskIsActive(task)) return;
         if (task.status === 'completed' && task.result) resolve(task.result);
-        else reject({ code: task.status === 'cancelled' ? 'cancelled' : 'pipeline_failed', message: task.error?.message ?? task.status, failedStage: task.error?.failed_stage, engine: task.error?.engine, failureKind: task.error?.classification, failureId: task.error?.failure_id, projectId: task.project_id });
+        else reject({ code: task.status === 'cancelled' ? 'cancelled' : 'pipeline_failed', message: task.error?.message ?? task.status, failedStage: task.error?.failed_stage, component: task.error?.component, failureKind: task.error?.classification, failureId: task.error?.failure_id, projectId: task.project_id });
       };
       void (async () => {
         unsubscribe = await onTaskUpdate(update => apply(update.task));

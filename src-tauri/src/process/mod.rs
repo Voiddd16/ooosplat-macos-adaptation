@@ -307,7 +307,7 @@ impl ProcessManager {
         environment: &[(OsString, OsString)],
     ) -> Result<ProcessOutput> {
         if !spec.executable.is_file() {
-            return Err(SplatError::EngineMissing(
+            return Err(SplatError::ComponentMissing(
                 spec.executable.display().to_string(),
             ));
         }
@@ -342,7 +342,7 @@ impl ProcessManager {
         }
 
         let mut child = command.spawn().map_err(|error| SplatError::EngineStart {
-            engine: spec.executable.display().to_string(),
+            component: spec.executable.display().to_string(),
             detail: error.to_string(),
         })?;
         let process_id = child

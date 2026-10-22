@@ -1,11 +1,17 @@
 export type PipelineErrorCode = "cancelled" | "pipeline_failed";
-export type PipelineFailureKind = "mapper_source" | "mapper_storage" | "brush_gpu" | "brush_device_lost" | "brush_dataset";
+/**
+ * 失败分类（**中性**命名）：不区分是哪个后端/训练器出的问题。
+ * 与 Rust 侧 `contracts::FailureKind` 一一对应。
+ */
+export type PipelineFailureKind =
+  | "reconstructionInput" | "reconstructionStorage"
+  | "trainingAccelerator" | "trainingDeviceLost" | "trainingDataset";
 
 export interface PipelineCommandError {
   code: PipelineErrorCode;
   message: string;
   failedStage?: string;
-  engine?: "system" | "ffmpeg" | "colmap" | "brush";
+  component?: "system" | "media" | "reconstruction" | "training";
   failureKind?: PipelineFailureKind;
   projectId?: string;
   projectPath?: string;
@@ -13,7 +19,10 @@ export interface PipelineCommandError {
   failureId?: string;
 }
 
-const failureKinds = new Set<PipelineFailureKind>(["mapper_source", "mapper_storage", "brush_gpu", "brush_device_lost", "brush_dataset"]);
+const failureKinds = new Set<PipelineFailureKind>([
+  "reconstructionInput", "reconstructionStorage",
+  "trainingAccelerator", "trainingDeviceLost", "trainingDataset",
+]);
 
 export function pipelineCommandError(error: unknown): PipelineCommandError | null {
   if (typeof error !== "object" || error == null) return null;
@@ -24,14 +33,14 @@ export function pipelineCommandError(error: unknown): PipelineCommandError | nul
   const failureKind = typeof candidate.failureKind === "string" && failureKinds.has(candidate.failureKind as PipelineFailureKind)
     ? candidate.failureKind as PipelineFailureKind
     : undefined;
-  const engine = ["system", "ffmpeg", "colmap", "brush"].includes(String(candidate.engine))
-    ? candidate.engine as PipelineCommandError["engine"]
+  const component = ["system", "media", "reconstruction", "training"].includes(String(candidate.component))
+    ? candidate.component as PipelineCommandError["component"]
     : undefined;
   return {
     code,
     message,
     failedStage: typeof candidate.failedStage === "string" ? candidate.failedStage : undefined,
-    engine,
+    component,
     failureKind,
     projectId: typeof candidate.projectId === "string" ? candidate.projectId : undefined,
     projectPath: typeof candidate.projectPath === "string" ? candidate.projectPath : undefined,

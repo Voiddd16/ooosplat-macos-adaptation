@@ -4,7 +4,7 @@ pub(crate) mod redact;
 
 use crate::{
     commands::PipelineController,
-    pipeline::{PipelineEngine, PipelineStage},
+    pipeline::{PipelineComponent, PipelineStage},
     project::catalog,
 };
 use chrono::{DateTime, Utc};
@@ -53,7 +53,7 @@ pub struct DiagnosticReport {
     pub timestamp: DateTime<Utc>,
     pub app_version: String,
     pub stage: Option<PipelineStage>,
-    pub engine: Option<PipelineEngine>,
+    pub component: Option<PipelineComponent>,
     pub error_code: String,
     pub reason: String,
     pub detail: String,
@@ -149,7 +149,7 @@ impl DiagnosticService {
     pub async fn capture(
         &self,
         stage: Option<PipelineStage>,
-        engine: Option<PipelineEngine>,
+        component: Option<PipelineComponent>,
         kind: Option<&str>,
         message: &str,
         project_id: Option<Uuid>,
@@ -163,15 +163,15 @@ impl DiagnosticService {
             if let Ok((root, metadata)) = catalog::load_registered_project(project_id).await {
                 private_names.push(metadata.name);
                 private_paths.extend([root.clone(), metadata.source_path]);
-                let names: &[&str] = match engine {
-                    Some(PipelineEngine::Brush) => &["brush.log", "brush-retry.log"],
-                    Some(PipelineEngine::Colmap) => &[
+                let names: &[&str] = match component {
+                    Some(PipelineComponent::Training) => &["brush.log", "brush-retry.log"],
+                    Some(PipelineComponent::Reconstruction) => &[
                         "colmap.log",
                         "colmap-bridge-features.log",
                         "colmap-bridge-matching.log",
                         "colmap-bridge-mapper.log",
                     ],
-                    Some(PipelineEngine::Ffmpeg) => {
+                    Some(PipelineComponent::Media) => {
                         &["ffmpeg.log", "ffprobe.log", "ffmpeg-bridge.log"]
                     }
                     _ => &[],
@@ -212,7 +212,7 @@ impl DiagnosticService {
             timestamp: Utc::now(),
             app_version: env!("CARGO_PKG_VERSION").into(),
             stage,
-            engine,
+            component,
             error_code: kind.unwrap_or("pipeline_failed").into(),
             reason: reason(kind).into(),
             detail: redact::bounded(&redact::sanitize(message, &private), 16 * 1024),
@@ -445,7 +445,7 @@ mod tests {
         let id = service
             .capture(
                 Some(PipelineStage::Matching),
-                Some(PipelineEngine::Colmap),
+                Some(PipelineComponent::Reconstruction),
                 None,
                 "failed /private/file.jpg: early eof",
                 None,
@@ -472,7 +472,7 @@ mod tests {
                     timestamp: Utc::now(),
                     app_version: "test".into(),
                     stage: None,
-                    engine: None,
+                    component: None,
                     error_code: "pipeline_failed".into(),
                     reason: "test".into(),
                     detail: "early eof".into(),
@@ -684,7 +684,7 @@ mod tests {
         let id = service
             .capture(
                 None,
-                Some(PipelineEngine::Brush),
+                Some(PipelineComponent::Training),
                 None,
                 "Device Lost",
                 None,

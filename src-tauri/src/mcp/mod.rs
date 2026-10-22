@@ -368,11 +368,11 @@ impl McpTools {
                 let engines = self.engines.check_all().await;
                 let engines_ready = engines
                     .iter()
-                    .all(|engine| engine.exists && engine.can_start);
+                    .all(|component| component.ready);
                 let active = self.tasks.running().await?;
                 let can_start = active.is_none() && engines_ready;
                 Ok(
-                    json!({"app_version":env!("CARGO_PKG_VERSION"),"engines":engines.into_iter().map(|e|json!({"name":e.kind,"version":e.version,"available":e.exists&&e.can_start})).collect::<Vec<_>>(),"authorized_input_roots":self.settings.input_roots,"capabilities":["local_video_generation","local_image_generation","task_status","bounded_logs","cancellation"],"running_task":active.map(public_task).transpose()?,"can_start_task":can_start,"recommended_poll_seconds":20}),
+                    json!({"app_version":env!("CARGO_PKG_VERSION"),"engines":engines.into_iter().map(|c|json!({"name":c.kind,"ready":c.ready,"detail":c.detail})).collect::<Vec<_>>(),"authorized_input_roots":self.settings.input_roots,"capabilities":["local_video_generation","local_image_generation","task_status","bounded_logs","cancellation"],"running_task":active.map(public_task).transpose()?,"can_start_task":can_start,"recommended_poll_seconds":20}),
                 )
             }
             "create_generation_task" => {

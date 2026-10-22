@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { localConfiguration, localInvocation } from "./local-tauri.mjs";
+import { brushPreparationPolicy, enginePreflight, localConfiguration, localFeatures, localInvocation } from "./local-tauri.mjs";
 import { artifactSummary, placements } from "./colmap-artifact-summary.mjs";
 import { dependencyPath, deploymentVersion, versionAtMost } from "./verify-macos-colmap-runtime.mjs";
 import { collectComponentNotices, isLicenseNotice } from "./collect-macos-component-notices.mjs";
@@ -37,7 +37,8 @@ test("local Tauri invocation bypasses COLMAP checks and does not modify manifest
       const invocation = localInvocation(action, platform, ["--help"]);
       assert.equal(invocation.command, process.execPath);
       assert.equal(invocation.args[1], action);
-      assert.deepEqual(invocation.args.slice(2, 5), ["--features", "local-colmap", "--config"]);
+      const expected = platform === "darwin" ? "local-colmap,backend-ooo-sfm" : "local-colmap";
+      assert.deepEqual(invocation.args.slice(2, 5), ["--features", expected, "--config"]);
       assert.equal(JSON.parse(invocation.args[5]).build.beforeBuildCommand, "npm run build");
       assert.equal(invocation.args.at(-1), "--help");
       assert.doesNotMatch(JSON.stringify(invocation), /verify:engines|setup:engines|lock-engine|archiveSha256/);
@@ -48,6 +49,21 @@ test("local Tauri invocation bypasses COLMAP checks and does not modify manifest
   const source = read("scripts/local-tauri.mjs");
   assert.match(source, /prepareBrush\(hostPlatform\(\)\)/);
   assert.doesNotMatch(source, /setup-colmap|setup:engines|verify:engines|setup-engines/);
+});
+
+test("macOS local builds enable the self-hosted backend; Windows and Linux keep COLMAP", () => {
+  assert.deepEqual(localFeatures("darwin"), ["local-colmap", "backend-ooo-sfm"]);
+  for (const platform of ["win32", "linux"]) {
+    assert.deepEqual(localFeatures(platform), ["local-colmap"]);
+    const invocation = localInvocation("build", platform, []);
+    assert.doesNotMatch(invocation.args.join(" "), /backend-ooo-sfm/);
+  }
+  // Metal 必须显式要求，不能被默认带上。
+  assert.doesNotMatch(localFeatures("darwin").join(","), /backend-ooo-sfm-metal/);
+  // feature 覆盖可从参数传入（OOO_SFM_METAL=1 的实现路径）。
+  const withMetal = localInvocation("build", "darwin", [], ["local-colmap", "backend-ooo-sfm", "backend-ooo-sfm-metal"]);
+  assert.equal(withMetal.args[3], "local-colmap,backend-ooo-sfm,backend-ooo-sfm-metal");
+  assert.throws(() => localFeatures("unsupported"), /Unsupported/);
 });
 
 test("local macOS config replaces old COLMAP with the separate dependency directory", () => {
@@ -78,6 +94,38 @@ test("Windows and Linux local builds replace strict COLMAP entries with the comp
     assert.match(base.build.beforeBuildCommand, /verify:engines|build:bundle/);
     assert.doesNotMatch(local.build.beforeBuildCommand, /verify|setup/);
   }
+});
+
+test("local macOS build trims bundled binaries when in-process media / brush skip is on", () => {
+  const options = { inProcessMedia: true, skipBrush: true, hostMinimumSystemVersion: "12.7.6" };
+  const local = mergePatch(
+    mergePatch(JSON.parse(read("src-tauri/tauri.conf.json")), JSON.parse(read("src-tauri/tauri.macos.conf.json"))),
+    localConfiguration("darwin", options)
+  );
+  const resources = local.bundle.resources;
+  const root = "../engines/macos/arm64";
+  for (const executable of ["ffmpeg", "ffprobe", "brush_app"]) {
+    assert.equal(resources[`${root}/bin/${executable}`], undefined, `${executable} should not be bundled`);
+  }
+  assert.equal(resources[`${root}/colmap/`], "engines/macos/arm64/colmap/");
+  assert.equal(local.bundle.macOS.signingIdentity, "-");
+  assert.equal(local.bundle.macOS.minimumSystemVersion, "12.7.6", "local bundle launches on the host OS");
+  // 默认 options 保持旧行为：三个二进制都映射。
+  const defaults = mergePatch(
+    mergePatch(JSON.parse(read("src-tauri/tauri.conf.json")), JSON.parse(read("src-tauri/tauri.macos.conf.json"))),
+    localConfiguration("darwin")
+  );
+  for (const executable of ["ffmpeg", "ffprobe", "brush_app"]) {
+    assert.ok(defaults.bundle.resources[`${root}/bin/${executable}`]);
+  }
+  assert.equal(defaults.bundle.macOS.minimumSystemVersion, "15.0", "default keeps the shipped minimum version");
+});
+
+test("enginePreflight drops external ffmpeg/ffprobe for the in-process media backend", () => {
+  const rows = enginePreflight("darwin", ["local-colmap", "backend-ooo-sfm", "media-rsmpeg"]);
+  assert.deepEqual(rows.map(row => row.label), ["OOOBrush"], JSON.stringify(rows));
+  const withCli = enginePreflight("darwin", ["local-colmap", "backend-ooo-sfm"]);
+  assert.deepEqual(withCli.map(row => row.label), ["ffmpeg", "ffprobe", "OOOBrush"]);
 });
 
 test("manual workflow only builds selected platforms and never publishes a Release", () => {
@@ -434,4 +482,26 @@ test("a corrupt dependency source is rejected before its license contents are re
     fs.writeFileSync(args.at(-1), "corrupt source");
     return { status: 0, stdout: "", stderr: "" };
   }), /license-source SHA-256 mismatch/);
+});
+
+test("a failed Brush download warns on dev but still fails a bundle build", () => {
+  assert.equal(brushPreparationPolicy("dev", undefined), "warn");
+  assert.equal(brushPreparationPolicy("build", undefined), "required");
+  assert.equal(brushPreparationPolicy("dev", "1"), "skipped");
+  assert.equal(brushPreparationPolicy("build", "1"), "skipped");
+  // build:local / dev:local 都不允许再无脑 prepareBrush 抛错 —— dev 必须可降级。
+  const source = read("scripts/local-tauri.mjs");
+  assert.match(source, /OOO_SKIP_BRUSH/);
+  assert.match(source, /准备失败，dev 继续启动/);
+});
+
+test("engine preflight reports what is missing without touching the network", () => {
+  const withSelfHosted = enginePreflight("darwin", ["local-colmap", "backend-ooo-sfm"]);
+  const withColmap = enginePreflight("darwin", ["local-colmap"]);
+  assert.deepEqual(withSelfHosted.map(row => row.label), ["ffmpeg", "ffprobe", "OOOBrush"]);
+  assert.deepEqual(withColmap.map(row => row.label), ["ffmpeg", "ffprobe", "COLMAP", "OOOBrush"]);
+  for (const row of [...withSelfHosted, ...withColmap]) {
+    assert.equal(typeof row.present, "boolean");
+    assert.ok(row.file.length > 0);
+  }
 });

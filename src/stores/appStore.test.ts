@@ -9,7 +9,7 @@ const event = (sequence: number, progress: number): PipelineEvent => ({
   kind: "progress",
   level: "info",
   stage: "ExtractingFrames",
-  engine: "ffmpeg",
+  component: "media",
   progress,
   stageProgress: progress,
   indeterminate: false,
@@ -24,8 +24,8 @@ const event = (sequence: number, progress: number): PipelineEvent => ({
 describe("app store", () => {
   beforeEach(() => {
     useAppStore.setState({
-      inputPath: null, inputType: "video", projectsRoot: "", projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null, video: null, imageSequence: null,
-      plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
+      inputPath: null, inputType: "video", projectsRoot: "", projects: [], quality: "balanced", acceleration: null, taskAcceleration: null, video: null, imageSequence: null,
+      plan: null, estimate: null, components: [], phase: "idle", progress: 0, progressMessage: "",
       latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], liveTask: null, result: null, error: null, errorAt: null,
     });
   });
@@ -201,16 +201,16 @@ describe("app store", () => {
       ...event(1, 0),
       kind: "capability",
       acceleration: {
-        backend: "gpu",
-        detectionState: "ready",
+        mode: "gpu",
+        state: "ready",
         reasonCode: "gpuReady",
         reason: "GPU ready",
         device: { index: 0, name: "RTX 3060 Ti", driverVersion: "560.81", computeCapability: "8.6" },
         requirements: { minimumDriverVersion: "528.33", minimumComputeCapability: "5.0" },
       },
     });
-    expect(useAppStore.getState().colmapAcceleration).toBeNull();
-    expect(useAppStore.getState().taskColmapAcceleration?.backend).toBe("gpu");
-    expect(useAppStore.getState().taskColmapAcceleration?.device?.index).toBe(0);
+    expect(useAppStore.getState().acceleration).toBeNull();
+    expect(useAppStore.getState().taskAcceleration?.mode).toBe("gpu");
+    expect(useAppStore.getState().taskAcceleration?.device?.index).toBe(0);
   });
 });

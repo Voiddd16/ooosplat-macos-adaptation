@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({ prepare: vi.fn(), send: vi.fn() }));
 vi.mock("../lib/backend", () => ({ prepareErrorReport: mocks.prepare, sendErrorReport: mocks.send }));
 import { ErrorReportDialog } from "./ErrorReportDialog";
 
-const draft: ErrorReportDraft = { draftId: "draft-token", report: { schemaVersion: 1, reportId: "report-id", timestamp: "2026-10-02T10:00:00Z", appVersion: "0.5.0", stage: "trainingSplats", engine: "brush", errorCode: "brush_dataset", reason: "Could not read data", detail: "early eof [REDACTED]", logTail: "last error", logsTruncated: true, environment: { system: { name: "Windows 11", version: "10.0", arch: "x86_64" }, gpus: [{ name: "Intel UHD", driverVersion: "1", totalMemoryMb: null, computeCapability: null }, { name: "NVIDIA RTX", driverVersion: "2", totalMemoryMb: 8192, computeCapability: "8.6" }], actualDevice: null } } };
+const draft: ErrorReportDraft = { draftId: "draft-token", report: { schemaVersion: 1, reportId: "report-id", timestamp: "2026-10-02T10:00:00Z", appVersion: "0.5.0", stage: "trainingSplats", component: "training", errorCode: "brush_dataset", reason: "Could not read data", detail: "early eof [REDACTED]", logTail: "last error", logsTruncated: true, environment: { system: { name: "Windows 11", version: "10.0", arch: "x86_64" }, gpus: [{ name: "Intel UHD", driverVersion: "1", totalMemoryMb: null, computeCapability: null }, { name: "NVIDIA RTX", driverVersion: "2", totalMemoryMb: 8192, computeCapability: "8.6" }], actualDevice: null } } };
 let container: HTMLDivElement, root: Root;
 const back = vi.fn(), sent = vi.fn();
 async function flush() { await act(async () => { await Promise.resolve(); }); }

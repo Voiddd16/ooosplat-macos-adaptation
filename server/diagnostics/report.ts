@@ -5,7 +5,8 @@ import { createHmac } from "node:crypto";
 export const MAX_REPORT_BYTES = 128 * 1024;
 const encoder = new TextEncoder();
 const stages = new Set(["created", "probingVideo", "planningFrames", "extractingFrames", "extractingFeatures", "matching", "reconstructing", "validatingReconstruction", "trainingSplats", "exporting"]);
-const engines = new Set(["system", "ffmpeg", "colmap", "brush"]);
+// 组件类别（中性）：媒体 / 重建 / 训练 —— 不含具体实现名。
+const components = new Set(["system", "media", "reconstruction", "training"]);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function object(value: unknown, keys: string[]): Record<string, unknown> {
@@ -22,10 +23,10 @@ function nullableText(value: unknown, max: number): string | null { return value
 function member(value: unknown, choices: Set<string>) { if (value !== null && (typeof value !== "string" || !choices.has(value))) throw new Error("Invalid enum"); }
 
 export function validateDiagnosticReport(value: unknown) {
-  const report = object(value, ["schemaVersion", "reportId", "timestamp", "appVersion", "stage", "engine", "errorCode", "reason", "detail", "logTail", "logsTruncated", "environment"]);
+  const report = object(value, ["schemaVersion", "reportId", "timestamp", "appVersion", "stage", "component", "errorCode", "reason", "detail", "logTail", "logsTruncated", "environment"]);
   if (report.schemaVersion !== 1 || !uuid.test(text(report.reportId, 36))) throw new Error("Invalid report identifier");
   if (!Number.isFinite(Date.parse(text(report.timestamp, 64)))) throw new Error("Invalid timestamp");
-  text(report.appVersion, 64); member(report.stage, stages); member(report.engine, engines);
+  text(report.appVersion, 64); member(report.stage, stages); member(report.component, components);
   text(report.errorCode, 64); text(report.reason, 512); text(report.detail, 16 * 1024); text(report.logTail, 64 * 1024);
   if ((report.logTail as string).split(/\r?\n/).length > 200) throw new Error("Too many log lines");
   if (typeof report.logsTruncated !== "boolean") throw new Error("Invalid truncation flag");
@@ -92,8 +93,8 @@ export function createDiagnosticReportHandler(database: ReportDatabase, allow: (
     catch (error) { return response(error instanceof RangeError ? 413 : 400, { error: "invalid_report" }); }
     try {
       await database.query(
-        "INSERT INTO ooosplat_error_reports (report_id, event_timestamp, app_version, failure_stage, engine, error_code, report) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) ON CONFLICT (report_id) DO NOTHING",
-        [report.reportId, report.timestamp, report.appVersion, report.stage, report.engine, report.errorCode, JSON.stringify(report)],
+        "INSERT INTO ooosplat_error_reports (report_id, event_timestamp, app_version, failure_stage, component, error_code, report) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) ON CONFLICT (report_id) DO NOTHING",
+        [report.reportId, report.timestamp, report.appVersion, report.stage, report.component, report.errorCode, JSON.stringify(report)],
       );
       return response(200, { accepted: true, reportId: report.reportId });
     } catch { return response(503, { error: "storage_unavailable" }); }

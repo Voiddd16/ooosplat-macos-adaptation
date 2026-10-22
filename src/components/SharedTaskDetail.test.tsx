@@ -42,7 +42,7 @@ describe('restored shared task detail', () => {
     const raw = 'RAW_ENGINE_DETAIL: CUDA worker 42 at E:\\Private\\input.png';
     for (const stage of stages) {
       const event: import('../types/pipeline').PipelineEvent = { sequence: 1, timestamp: '2026-10-09T00:00:00Z',
-        kind: 'log', level: 'info', stage: stage ?? 'created', engine: 'colmap', progress: 50, stageProgress: null,
+        kind: 'log', level: 'info', stage: stage ?? 'created', component: "reconstruction", progress: 50, stageProgress: null,
         indeterminate: true, message: raw, current: null, total: null, unit: null, elapsedMs: 1000, acceleration: null };
       await render(task({ stage, current: null, total: null, recent_events: [event] }));
       const caption = container.querySelector('.current-message')?.textContent;
@@ -60,7 +60,7 @@ describe('restored shared task detail', () => {
     const expected = { created: '正在准备任务', starting: '正在准备任务', cancelling: '正在终止任务',
       completed: '已完成', failed: '任务失败', cancelled: '已取消', interrupted: '已中断' };
     const error = { code: 'pipeline_failed', message: 'RAW_FAILURE_DETAIL: GPU driver reset at source.cpp:88',
-      failed_stage: 'trainingSplats', engine: 'brush', exit_code: 2, failure_id: null,
+      failed_stage: 'trainingSplats', component: "training", exit_code: 2, failure_id: null,
       classification: null, classification_is_heuristic: false };
     for (const [status, caption] of Object.entries(expected)) {
       await render(task({ status: status as SharedTask['status'], error }));
@@ -108,7 +108,7 @@ describe('restored shared task detail', () => {
   });
 
   it('marks a known failed stage and keeps the useful error without replacing it with a guessed cause', async () => {
-    await render(task({ status: 'failed', stage: 'failed', error: { code: 'pipeline_failed', message: 'device lost', failed_stage: 'trainingSplats', engine: 'brush', exit_code: 2, failure_id: null, classification: 'brush_gpu', classification_is_heuristic: true } }));
+    await render(task({ status: 'failed', stage: 'failed', error: { code: 'pipeline_failed', message: 'device lost', failed_stage: 'trainingSplats', component: "training", exit_code: 2, failure_id: null, classification: 'brush_gpu', classification_is_heuristic: true } }));
     await act(async () => container.querySelector<HTMLElement>('.inline-error .compact-error')!.focus());
     expect(document.querySelector('.error-detail-tooltip')?.textContent).toBe('device lost');
     expect(container.querySelectorAll('.stage-timeline li')[5].className).toBe('failed');
@@ -149,7 +149,7 @@ describe('restored shared task detail', () => {
 
   it('keeps log rows stable during runtime-only updates and explains display truncation', async () => {
     const events: import('../types/pipeline').PipelineEvent[] = [{ sequence: 1, timestamp: '2026-10-09T00:00:00Z',
-      kind: 'log', level: 'info', stage: 'reconstructing', engine: 'colmap', progress: 50, stageProgress: null,
+      kind: 'log', level: 'info', stage: 'reconstructing', component: "reconstruction", progress: 50, stageProgress: null,
       indeterminate: true, message: 'registration detail', current: null, total: null, unit: null,
       elapsedMs: 1000, acceleration: null }];
     await render(task({ stage: 'reconstructing', recent_events: events }));

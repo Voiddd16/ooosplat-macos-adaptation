@@ -1,6 +1,6 @@
 //! ooo-sfm 的 BA（光束法平差）领域层。
 //!
-//! 本文件经 `engines/mod.rs` 的 `#[cfg(feature = "ooo-sfm")] + #[path]` 门面，
+//! 本文件经 `engines/mod.rs` 的 `#[cfg(feature = "backend-ooo-sfm")] + #[path]` 门面，
 //! 以 `engines::colmap_ba` 的名义对外暴露；公开签名与 `engines/colmap_ba.rs` **逐字一致**。
 //!
 //! 原实现是"是否启用 Caspar（CUDA GPU BA）"的启发式探测；自研侧按平台重写（决策 D4）：

@@ -147,7 +147,7 @@ pub fn extract(sink: &ProgressSink, request: &ExtractionRequest) -> Result<()> {
         let mut work: Vec<&String> = Vec::new();
         for name in chunk {
             if let Some((image_id, _)) = database::read_image_by_name(&connection, name)? {
-                if database::has_keypoints_and_descriptors(&connection, image_id)? {
+                if database::has_complete_features(&connection, image_id)? {
                     index += 1;
                     sink.log(format!("Processed file [{index}/{total}]"));
                     sink.log(format!("  Name:            {name}"));
@@ -264,6 +264,8 @@ struct Prepared {
     thumbnail_width: usize,
     thumbnail_height: usize,
     features: Vec<sift::SiftFeature>,
+    /// 每个 `features` 条目在全分辨率彩色图上的 5×5 均值色（RGB）。
+    colors: Vec<[u8; 3]>,
     mask: Option<Mask>,
     notes: Vec<String>,
     /// EXIF 焦点长度（像素）；`None` = 无先验（相机用默认系数建，`prior_focal_length = 0`）。
@@ -316,8 +318,24 @@ fn prepare_image(
         return Err(Skipped::Cancelled);
     }
     let path = request.images.join(name);
-    let mut bitmap = load_gray(&path).map_err(Skipped::Bitmap)?;
-    let (width, height) = (bitmap.width as u64, bitmap.height as u64);
+    // 解码到彩色（RGB）后转灰度喂 SIFT；彩色副本保留下来给特征点采色。
+    let decoded = image::open(&path).map_err(|e| Skipped::Bitmap(e.to_string()))?;
+    let (width, height) = (decoded.width() as u64, decoded.height() as u64);
+    if width == 0 || height == 0 {
+        return Err(Skipped::Bitmap("图像尺寸为 0".to_string()));
+    }
+    let color_bitmap = decoded.to_rgb8();
+    let mut bitmap = {
+        let width = color_bitmap.width() as usize;
+        let height = color_bitmap.height() as usize;
+        let mut pixels = Vec::with_capacity(width * height);
+        for pixel in color_bitmap.pixels() {
+            let [r, g, b] = pixel.0;
+            let gray = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32 + 0.5) as u8;
+            pixels.push(gray as f32 / 255.0);
+        }
+        GrayImage::new(width, height, pixels)
+    };
     // EXIF 焦点长度（4.2.1 `ImageReader` 的相机分支：有效则用 EXIF，否则默认系数）。
     let exif_focal_length = exif::file_focal_length(&path, width, height);
     let mask = match &request.masks {
@@ -346,6 +364,20 @@ fn prepare_image(
     // 注意：这里的尺寸是**缩略图**尺寸，`features` 的坐标就在这个坐标系里。
     let (thumbnail_width, thumbnail_height) = (bitmap.width, bitmap.height);
     let extraction = sift::extract(&bitmap, options);
+    // 特征点观测颜色：全分辨率彩色图上按 5×5 patch 均值（缩略图坐标 → 原图坐标）。
+    let color_scale_x = width as f64 / thumbnail_width as f64;
+    let color_scale_y = height as f64 / thumbnail_height as f64;
+    let colors: Vec<[u8; 3]> = extraction
+        .features
+        .iter()
+        .map(|feature| {
+            patch_color(
+                &color_bitmap,
+                feature.x as f64 * color_scale_x,
+                feature.y as f64 * color_scale_y,
+            )
+        })
+        .collect();
     Ok(Prepared {
         name: name.to_string(),
         width,
@@ -353,10 +385,32 @@ fn prepare_image(
         thumbnail_width,
         thumbnail_height,
         features: extraction.features,
+        colors,
         mask,
         notes: extraction.notes,
         exif_focal_length,
     })
+}
+
+/// 在 RGB 图上取 5×5 patch 均值色（边缘 clamp，不越界）。
+fn patch_color(rgb: &image::RgbImage, x: f64, y: f64) -> [u8; 3] {
+    let w = rgb.width() as i64;
+    let h = rgb.height() as i64;
+    let cx = (x.round() as i64).clamp(0, w - 1);
+    let cy = (y.round() as i64).clamp(0, h - 1);
+    let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+    for dy in -2..=2 {
+        for dx in -2..=2 {
+            let pixel = rgb.get_pixel(
+                (cx + dx).clamp(0, w - 1) as u32,
+                (cy + dy).clamp(0, h - 1) as u32,
+            );
+            r += pixel[0] as u32;
+            g += pixel[1] as u32;
+            b += pixel[2] as u32;
+        }
+    }
+    [(r / 25) as u8, (g / 25) as u8, (b / 25) as u8]
 }
 
 /// 写库：相机 → 图像行 → 特征点/描述子 → frame；返回写入的特征数（跳过的图返回 `None`）。
@@ -431,8 +485,9 @@ fn write_prepared(
     let scale_x = camera.width as f32 / image.thumbnail_width as f32;
     let scale_y = camera.height as f32 / image.thumbnail_height as f32;
     let mut keypoints = Vec::with_capacity(image.features.len());
+    let mut colors = Vec::with_capacity(image.features.len());
     let mut descriptors = Vec::with_capacity(image.features.len() * sift::DESCRIPTOR_DIM);
-    for feature in &image.features {
+    for (feature, color) in image.features.iter().zip(&image.colors) {
         let x = feature.x * scale_x;
         let y = feature.y * scale_y;
         if let Some(mask) = &image.mask {
@@ -450,11 +505,14 @@ fn write_prepared(
                 feature.shape[3] * scale_y,
             ],
         });
+        colors.push(*color);
         descriptors.extend_from_slice(&feature.descriptor);
     }
 
     database::begin_bulk(connection)?;
     database::write_keypoints(connection, image_id, &keypoints)?;
+    database::write_descriptors(connection, image_id, &descriptors)?;
+    database::write_feature_colors(connection, image_id, &colors)?;
     database::write_descriptors(connection, image_id, &descriptors)?;
     if let Some(rig_id) = *rig_id {
         database::insert_frame(connection, rig_id, image_id, camera.id)?;
@@ -542,24 +600,6 @@ fn collect_recursive(root: &Path, directory: &Path, names: &mut Vec<String>) -> 
         names.push(relative);
     }
     Ok(())
-}
-
-/// 读图为灰度 `f32`（COLMAP `Bitmap::Read(as_rgb = false)` + `CloneAsGrey`）。
-fn load_gray(path: &Path) -> std::result::Result<GrayImage, String> {
-    let decoded = image::open(path).map_err(|error| error.to_string())?;
-    let (width, height) = (decoded.width() as usize, decoded.height() as usize);
-    if width == 0 || height == 0 {
-        return Err("图像尺寸为 0".to_string());
-    }
-    // RGB（丢弃 alpha，与 COLMAP 一致）→ Rec.709 灰度，四舍五入到 u8。
-    let rgb = decoded.to_rgb8();
-    let mut pixels = Vec::with_capacity(width * height);
-    for pixel in rgb.pixels() {
-        let [r, g, b] = pixel.0;
-        let gray = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32 + 0.5) as u8;
-        pixels.push(gray as f32 / 255.0);
-    }
-    Ok(GrayImage::new(width, height, pixels))
 }
 
 /// 读掩码：`<mask_path>/<name>.png`，退化到 `<mask_path>/<stem>.png`（COLMAP 的两种命名）。

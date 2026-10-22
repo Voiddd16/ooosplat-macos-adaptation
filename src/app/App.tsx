@@ -23,7 +23,7 @@ import { useUpdateNotice } from "./useUpdateNotice";
 import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
 import {
-  cancelPipeline, checkColmapAcceleration, checkEngines, classifyDroppedInput, confirmAndDeleteProject, confirmLargeImageSequence, confirmSmallImageSequence,
+  cancelPipeline, getAcceleration, checkComponents, classifyDroppedInput, confirmAndDeleteProject, confirmLargeImageSequence, confirmSmallImageSequence,
   estimateProjectRuntime, getAppRuntimeStatus, getProjectOverview, getProjectTaskDetail, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
@@ -37,7 +37,7 @@ import { displayPath } from "../lib/displayPath";
 import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
-import type { EngineStatus, InputType, PipelineEvent, PipelineResult, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
+import type { ComponentStatus, InputType, PipelineEvent, PipelineResult, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
 import { createGenerationDraft, createReshootDraft, draftDisplayName, loadTaskWorkspace, nextGenerationOrdinal, saveTaskWorkspace, type TaskDraft, type TaskSelection } from "./taskWorkspace";
 import { displayStatusForDraft, draftIsRunnable, queuedDraftIds, reorderDrafts, type DraftDisplayStatus } from "./taskQueue";
@@ -101,7 +101,7 @@ type FailureDialogState = {
   projectId: string | null;
   rawMessage: string;
   failureId: string | null;
-  engine: string;
+  component: string;
 };
 
 const withTimeout = <T,>(operation: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> => new Promise<T>((resolve, reject) => {
@@ -118,15 +118,15 @@ const inferFailureDialog = (error: unknown, fallbackStage?: string, fallbackProj
   const stage = structured?.failedStage ?? fallbackStage;
   const rawMessage = structured?.message ?? pipelineErrorMessage(error) ?? "";
   let kind = structured?.failureKind;
-  if (!kind && stage === "reconstructing") kind = "mapper_source";
+  if (!kind && stage === "reconstructing") kind = "reconstructionInput";
   if (!kind && stage === "trainingSplats") {
     kind = /devicelost|device lost|device_lost|parent device is lost|vk_error_device_lost|dxgi_error_device_removed|显卡设备连接中断/i.test(rawMessage)
-      ? "brush_device_lost"
+      ? "trainingDeviceLost"
       : /early eof|failed to load dataset|i\/o error|io error|no such file|access denied|permission denied/i.test(rawMessage)
-        ? "brush_dataset"
-        : "brush_gpu";
+        ? "trainingDataset"
+        : "trainingAccelerator";
   }
-  return { kind: kind ?? "generic", projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage, failureId: structured?.failureId ?? null, engine: structured?.engine ?? "OOOSplat" };
+  return { kind: kind ?? "generic", projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage, failureId: structured?.failureId ?? null, component: structured?.component ?? "OOOSplat" };
 };
 
 function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }: {
@@ -140,29 +140,29 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
   const [reportOpen, setReportOpen] = useState(false);
   const [reportSent, setReportSent] = useState(false);
   useEffect(() => { setReportOpen(false); setReportSent(false); }, [failure]);
-  const mapper = failure.kind === "mapper_source" || failure.kind === "mapper_storage";
-  const dataset = failure.kind === "brush_dataset";
-  const deviceLost = failure.kind === "brush_device_lost";
+  const mapper = failure.kind === "reconstructionInput" || failure.kind === "reconstructionStorage";
+  const dataset = failure.kind === "trainingDataset";
+  const deviceLost = failure.kind === "trainingDeviceLost";
   const generic = failure.kind === "generic";
-  const title = generic ? t("failure.genericTitle") : mapper ? t("failure.mapperTitle") : dataset ? t("failure.brushDatasetTitle") : deviceLost ? t("failure.brushDeviceLostTitle") : t("failure.brushTitle");
-  const description = generic ? t("failure.genericDescription") : failure.kind === "mapper_source"
-    ? t("failure.mapperSource")
-    : failure.kind === "mapper_storage"
-      ? t("failure.mapperStorage")
+  const title = generic ? t("failure.genericTitle") : mapper ? t("failure.reconstructionTitle") : dataset ? t("failure.trainingDatasetTitle") : deviceLost ? t("failure.trainingDeviceLostTitle") : t("failure.trainingTitle");
+  const description = generic ? t("failure.genericDescription") : failure.kind === "reconstructionInput"
+    ? t("failure.reconstructionInput")
+    : failure.kind === "reconstructionStorage"
+      ? t("failure.reconstructionStorage")
       : dataset
-        ? t("failure.brushDataset")
+        ? t("failure.trainingDataset")
         : deviceLost
-          ? t("failure.brushDeviceLost")
-        : t("failure.brushGpu");
-  const tips: TranslationKey[] = generic ? ["failure.genericTip1", "failure.storageTip1"] : failure.kind === "mapper_source"
-    ? ["failure.mapperTip1", "failure.mapperTip2", "failure.mapperTip3"]
-    : failure.kind === "mapper_storage"
+          ? t("failure.trainingDeviceLost")
+        : t("failure.trainingAccelerator");
+  const tips: TranslationKey[] = generic ? ["failure.genericTip1", "failure.storageTip1"] : failure.kind === "reconstructionInput"
+    ? ["failure.reconstructionTip1", "failure.reconstructionTip2", "failure.reconstructionTip3"]
+    : failure.kind === "reconstructionStorage"
       ? ["failure.storageTip1", "failure.storageTip2"]
       : dataset
         ? ["failure.datasetTip1", "failure.datasetTip2"]
         : deviceLost
           ? ["failure.deviceLostTip1", "failure.deviceLostTip2", "failure.deviceLostTip3"]
-        : ["failure.brushTip1", "failure.brushTip2", "failure.brushTip3"];
+        : ["failure.trainingTip1", "failure.trainingTip2", "failure.trainingTip3"];
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -178,7 +178,7 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
     <section className="failure-guidance-dialog">
       <div className="failure-guidance-heading">
         <span><CircleAlert size={22} /></span>
-        <div><small>{generic ? failure.engine : mapper ? "COLMAP" : "Brush"}</small><h2 id="failure-guidance-title">{title}</h2></div>
+        <div><small>{generic ? failure.component : mapper ? t("top.reconstructionEngine") : t("top.trainingEngine")}</small><h2 id="failure-guidance-title">{title}</h2></div>
         <button type="button" aria-label={t("common.close")} disabled={action !== null} onClick={onClose}><X size={17} /></button>
       </div>
       <p>{description}</p>
@@ -248,8 +248,8 @@ const readSavedNumber = (key: string, fallback: number) => {
   }
 };
 
-function engineReady(engine: EngineStatus) {
-  return engine.canStart;
+function componentReady(component: ComponentStatus) {
+  return component.ready;
 }
 
 function DraftRow({ draft, selected, status, insertion, dragging, onSelect, onDelete, onPointerDown, onPointerMove, onPointerEnd, onKeyboardMove }: {
@@ -278,9 +278,9 @@ export function App() {
   const loadGaussian = useGaussianTransformStore((state) => state.load);
   const closeGaussian = useGaussianTransformStore((state) => state.close);
   const isRunning = store.phase === "running" || Object.values(sharedTasks).some(taskIsActive);
-  const systemAcceleration = store.colmapAcceleration;
-  const systemDetectionTemporary = systemAcceleration?.detectionState === "temporarilyUnavailable";
-  const systemAccelerationWarning = systemDetectionTemporary || Boolean(systemAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(systemAcceleration.reasonCode) && systemAcceleration.backend !== "gpu");
+  const systemAcceleration = store.acceleration;
+  const systemDetectionTemporary = systemAcceleration?.state === "temporarilyUnavailable";
+  const systemAccelerationWarning = systemDetectionTemporary || Boolean(systemAcceleration && !["noAccelerator", "cpuOnly"].includes(systemAcceleration.reasonCode) && systemAcceleration.mode !== "gpu");
   const liveLogRef = useRef<HTMLDivElement>(null);
   const followLiveLogRef = useRef(true);
   const workspaceRef = useRef<HTMLElement>(null);
@@ -372,7 +372,7 @@ export function App() {
       ?? (projectDetail?.project.id === selectedTask.id ? projectDetail.project : null)
     : null;
   const detailContextKey = selectedSharedTask ? `task:${selectedSharedTask.task_id}` : selectedDraft ? `draft:${selectedDraft.id}` : selectedProject ? `project:${selectedProject.id}` : "global";
-  const missingEngines = store.engines.filter((engine) => !engineReady(engine));
+  const missingComponents = store.components.filter((component) => !componentReady(component));
   const sharedProjectIds = new Set(Object.values(sharedTasks).filter(task => !task.project_deleted).map(task => task.project_id));
   const completed = store.projects.filter(project => project.status === "completed" && !sharedProjectIds.has(project.id));
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed" && !sharedProjectIds.has(project.id) && !drafts.some((draft) => draft.running && (draft.linkedProjectId === project.id || draft.id === project.workspaceTaskId))), [drafts, store.projects, sharedTasks]);
@@ -393,8 +393,8 @@ export function App() {
   const currentMessage = useProgressMessage(store.phase, progressEvent?.stage ?? null, store.events, store.latestRuntime);
   const messageOf = useCallback((error: unknown) => rawMessageOf(error) ?? t("error.generic"), [t]);
   const queuedDrafts = useMemo(
-    () => queuedDraftIds(drafts, activeDraftId, autoRunNext, Boolean(store.projectsRoot) && missingEngines.length === 0),
-    [activeDraftId, autoRunNext, drafts, missingEngines.length, store.projectsRoot],
+    () => queuedDraftIds(drafts, activeDraftId, autoRunNext, Boolean(store.projectsRoot) && missingComponents.length === 0),
+    [activeDraftId, autoRunNext, drafts, missingComponents.length, store.projectsRoot],
   );
   const runBusy = isRunning || runGateBusy;
   useEffect(() => {
@@ -718,7 +718,7 @@ export function App() {
   const reconcileRuntimeState = useCallback(async () => {
     const runtime = await getAppRuntimeStatus();
     const appState = useAppStore.getState();
-    appState.setTaskColmapAcceleration(runtime.taskAcceleration ?? null);
+    appState.setTaskAcceleration(runtime.acceleration ?? null);
     if (runtime.pipelineRunning) {
       runElapsedOffset.current = runtime.pipelineElapsedOffsetMs ?? 0;
       const runElapsed = runtime.pipelineRunElapsedMs ?? 0;
@@ -770,9 +770,9 @@ export function App() {
 
   const refreshSystemAcceleration = useCallback(async () => {
     const revision = ++accelerationRequestRevision.current;
-    const acceleration = await checkColmapAcceleration();
+    const acceleration = await getAcceleration();
     if (revision === accelerationRequestRevision.current && acceleration) {
-      useAppStore.getState().setColmapAcceleration(acceleration);
+      useAppStore.getState().setAcceleration(acceleration);
     }
   }, []);
 
@@ -807,15 +807,15 @@ export function App() {
       })
       .catch((error) => store.setError(messageOf(error)));
     const revision = ++accelerationRequestRevision.current;
-    void checkEngines()
-      .then((engines) => {
-        store.setEngines(engines);
+    void checkComponents()
+      .then((components) => {
+        store.setComponents(components);
         if (revision === accelerationRequestRevision.current) {
-          store.setColmapAcceleration(engines.find((engine) => engine.kind === "colmap")?.acceleration ?? null);
+          store.setAcceleration(components.find((component) => component.kind === "reconstruction")?.acceleration ?? null);
         }
       })
       .catch(() => undefined);
-  }, [store.setEngines, store.setProjects, store.setProjectsRoot, store.setPlannerEnabled, store.setColmapAcceleration, store.setError]);
+  }, [store.setComponents, store.setProjects, store.setProjectsRoot, store.setPlannerEnabled, store.setAcceleration, store.setError]);
 
   useEffect(() => {
     const retry = () => {
@@ -1515,8 +1515,8 @@ export function App() {
       if (!autoRunNextRef.current) return;
       if (revision !== queueRevisionRef.current) continue;
       candidate = taskWorkspaceRef.current.drafts[nextIndex];
-      const enginesReady = useAppStore.getState().engines.every(engineReady);
-      if (!candidate || !draftIsRunnable(candidate) || !enginesReady || !useAppStore.getState().projectsRoot) {
+      const componentsReady = useAppStore.getState().components.every(componentReady);
+      if (!candidate || !draftIsRunnable(candidate) || !componentsReady || !useAppStore.getState().projectsRoot) {
         setAutoQueueEnabled(false);
         return;
       }
@@ -1662,7 +1662,7 @@ export function App() {
         <button className="settings-action language-action" type="button" title={t("language.switchTo")} aria-label={t("language.switchTo")} onClick={toggleLocale}><Languages size={15} />{t("language.target")}</button>
         {updates.release && <button className="settings-action update-notice-action" type="button" onClick={updates.open}><BellDot size={15} />{t("update.found")}</button>}
         <button className="settings-action" type="button" onClick={() => setSettingsOpen(true)}><Settings2 size={15} />{t("top.settings")}</button>
-        <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? t("top.checkingEngines") : missingEngines.length ? t("top.engineIssues", { count: missingEngines.length }) : t("top.enginesReady")}</div>
+        <div className="engine-summary"><span className={missingComponents.length ? "status-light warning" : "status-light"} />{store.components.length === 0 ? t("top.checkingEngines") : missingComponents.length ? t("top.engineIssues", { count: missingComponents.length }) : t("top.enginesReady")}</div>
       </div>
     </header>
 
@@ -1670,7 +1670,7 @@ export function App() {
       <section className="control-pane" ref={controlPaneRef} aria-label={t("task.console")}>
         <div className="pane-header"><h1>{selectedSharedTask ? basename(selectedSharedTask.input_path) : selectedProject?.name ?? (selectedDraft?.kind === "reshoot" ? draftDisplayName(selectedDraft, t("workspace.newTask"), t("project.reshoot")) : t("task.create"))}</h1><span className={(selectedSharedTask ? taskIsActive(selectedSharedTask) : selectedShowsLiveRun) ? "run-state active" : "run-state"}>{selectedSharedTask ? taskStatusLabel(locale,selectedSharedTask.status) : selectedProject ? t(statusKey[selectedProject.status]) : selectedShowsLiveRun ? t("task.running") : t("task.idle")}</span></div>
 
-        {selectedSharedTask && <SharedTaskDetail key={`${selectedSharedTask.task_id}:${selectedSharedTask.run_id}`} task={selectedSharedTask} externalError={projectActionError?.projectId === selectedSharedTask.project_id ? projectActionError.message : null} project={store.projects.find(item => item.id === selectedSharedTask.project_id)} acceleration={systemAcceleration} showRuntimePanel={uiPreferences.showRuntimePanel} canStart={!isRunning && !runGateBusy && missingEngines.length === 0} onResume={resume} />}
+        {selectedSharedTask && <SharedTaskDetail key={`${selectedSharedTask.task_id}:${selectedSharedTask.run_id}`} task={selectedSharedTask} externalError={projectActionError?.projectId === selectedSharedTask.project_id ? projectActionError.message : null} project={store.projects.find(item => item.id === selectedSharedTask.project_id)} acceleration={systemAcceleration} showRuntimePanel={uiPreferences.showRuntimePanel} canStart={!isRunning && !runGateBusy && missingComponents.length === 0} onResume={resume} />}
 
         {selectedDraft?.kind === "generation" && <><div className="form-section">
           <div className="field-label-row input-label-row"><label className="field-label">{t("input.label")}</label><CaptureAdviceHelp /></div>
@@ -1720,12 +1720,12 @@ export function App() {
           </div>
         </div>
 
-        <div className={`acceleration-status ${systemDetectionTemporary ? "warning" : systemAcceleration?.backend === "gpu" ? "gpu" : systemAccelerationWarning ? "warning" : "cpu"}`} aria-live="polite">
-          <span className="acceleration-icon">{systemAcceleration == null ? <LoaderCircle className="spin" size={17} /> : systemDetectionTemporary || systemAccelerationWarning ? <CircleAlert size={17} /> : systemAcceleration.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
+        <div className={`acceleration-status ${systemDetectionTemporary ? "warning" : systemAcceleration?.mode === "gpu" ? "gpu" : systemAccelerationWarning ? "warning" : "cpu"}`} aria-live="polite">
+          <span className="acceleration-icon">{systemAcceleration == null ? <LoaderCircle className="spin" size={17} /> : systemDetectionTemporary || systemAccelerationWarning ? <CircleAlert size={17} /> : systemAcceleration.mode === "gpu" ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
           <span>
-            <strong>{systemAcceleration == null ? t("gpu.detecting") : systemDetectionTemporary ? t("gpu.temporarilyUnavailable") : systemAcceleration.backend === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
-            <small>{systemAcceleration == null ? t("gpu.reading") : systemDetectionTemporary ? `${t("gpu.temporaryHint")}${systemAcceleration.device ? ` · ${systemAcceleration.device.name}` : ""}` : systemAcceleration.backend === "gpu" && systemAcceleration.device ? `${systemAcceleration.device.name}${systemAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (systemAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: systemAcceleration.device.driverVersion })} · Compute Capability ${systemAcceleration.device.computeCapability}` : systemAcceleration.reasonCode === "macOsCpuOnly" ? localizePipelineMessage(locale, systemAcceleration.reason) : `${localizePipelineMessage(locale, systemAcceleration.reason)} · ${t("gpu.requirements", { driver: systemAcceleration.requirements.minimumDriverVersion, capability: systemAcceleration.requirements.minimumComputeCapability })}`}</small>
-            {selectedShowsLiveRun && store.taskColmapAcceleration && <small>{t("gpu.currentTask")} · {store.taskColmapAcceleration.backend === "gpu" ? t("gpu.taskGpu", { device: store.taskColmapAcceleration.device?.name ?? "NVIDIA GPU" }) : t("gpu.taskCpu")}</small>}
+            <strong>{systemAcceleration == null ? t("gpu.detecting") : systemDetectionTemporary ? t("gpu.temporarilyUnavailable") : systemAcceleration.mode === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
+            <small>{systemAcceleration == null ? t("gpu.reading") : systemDetectionTemporary ? `${t("gpu.temporaryHint")}${systemAcceleration.device ? ` · ${systemAcceleration.device.name}` : ""}` : systemAcceleration.mode === "gpu" && systemAcceleration.device ? `${systemAcceleration.device.name}${systemAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (systemAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: systemAcceleration.device.driverVersion })} · Compute Capability ${systemAcceleration.device.computeCapability}` : systemAcceleration.reasonCode === "cpuOnly" ? localizePipelineMessage(locale, systemAcceleration.reason) : `${localizePipelineMessage(locale, systemAcceleration.reason)} · ${t("gpu.requirements", { driver: systemAcceleration.requirements.minimumDriverVersion, capability: systemAcceleration.requirements.minimumComputeCapability })}`}</small>
+            {selectedShowsLiveRun && store.taskAcceleration && <small>{t("gpu.currentTask")} · {store.taskAcceleration.mode === "gpu" ? t("gpu.taskGpu", { device: store.taskAcceleration.device?.name ?? "NVIDIA GPU" }) : t("gpu.taskCpu")}</small>}
           </span>
         </div>
 
@@ -1743,7 +1743,7 @@ export function App() {
 
         {selectedDraft.imageSequence?.requiresLargeSequenceConfirmation && <div className="sequence-warning" role="status"><CircleAlert size={16} /><span><strong>{t("sequence.title")}</strong><small>{t("sequence.hint")}</small></span></div>}
 
-        <button className="primary-action" type="button" disabled={runBusy || selectedDraft.inputChecking || !selectedDraft.inputPath || !selectedDraft.plan || !store.projectsRoot || missingEngines.length > 0} onClick={() => void generate()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
+        <button className="primary-action" type="button" disabled={runBusy || selectedDraft.inputChecking || !selectedDraft.inputPath || !selectedDraft.plan || !store.projectsRoot || missingComponents.length > 0} onClick={() => void generate()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
         {detailErrorBanner}
         </>}
 
@@ -1800,11 +1800,11 @@ export function App() {
             </div>
           </div>
 
-          <div className={`acceleration-status ${systemDetectionTemporary ? "warning" : systemAcceleration?.backend === "gpu" ? "gpu" : systemAccelerationWarning ? "warning" : "cpu"}`} aria-live="polite">
-            <span className="acceleration-icon">{systemAcceleration == null ? <LoaderCircle className="spin" size={17} /> : systemDetectionTemporary || systemAccelerationWarning ? <CircleAlert size={17} /> : systemAcceleration.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
+          <div className={`acceleration-status ${systemDetectionTemporary ? "warning" : systemAcceleration?.mode === "gpu" ? "gpu" : systemAccelerationWarning ? "warning" : "cpu"}`} aria-live="polite">
+            <span className="acceleration-icon">{systemAcceleration == null ? <LoaderCircle className="spin" size={17} /> : systemDetectionTemporary || systemAccelerationWarning ? <CircleAlert size={17} /> : systemAcceleration.mode === "gpu" ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
             <span>
-              <strong>{systemAcceleration == null ? t("gpu.detecting") : systemDetectionTemporary ? t("gpu.temporarilyUnavailable") : systemAcceleration.backend === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
-              <small>{systemAcceleration == null ? t("gpu.reading") : systemDetectionTemporary ? `${t("gpu.temporaryHint")}${systemAcceleration.device ? ` · ${systemAcceleration.device.name}` : ""}` : systemAcceleration.backend === "gpu" && systemAcceleration.device ? `${systemAcceleration.device.name}${systemAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (systemAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: systemAcceleration.device.driverVersion })} · Compute Capability ${systemAcceleration.device.computeCapability}` : systemAcceleration.reasonCode === "macOsCpuOnly" ? localizePipelineMessage(locale, systemAcceleration.reason) : `${localizePipelineMessage(locale, systemAcceleration.reason)} · ${t("gpu.requirements", { driver: systemAcceleration.requirements.minimumDriverVersion, capability: systemAcceleration.requirements.minimumComputeCapability })}`}</small>
+              <strong>{systemAcceleration == null ? t("gpu.detecting") : systemDetectionTemporary ? t("gpu.temporarilyUnavailable") : systemAcceleration.mode === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
+              <small>{systemAcceleration == null ? t("gpu.reading") : systemDetectionTemporary ? `${t("gpu.temporaryHint")}${systemAcceleration.device ? ` · ${systemAcceleration.device.name}` : ""}` : systemAcceleration.mode === "gpu" && systemAcceleration.device ? `${systemAcceleration.device.name}${systemAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (systemAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: systemAcceleration.device.driverVersion })} · Compute Capability ${systemAcceleration.device.computeCapability}` : systemAcceleration.reasonCode === "cpuOnly" ? localizePipelineMessage(locale, systemAcceleration.reason) : `${localizePipelineMessage(locale, systemAcceleration.reason)} · ${t("gpu.requirements", { driver: systemAcceleration.requirements.minimumDriverVersion, capability: systemAcceleration.requirements.minimumComputeCapability })}`}</small>
             </span>
           </div>
 
@@ -1816,7 +1816,7 @@ export function App() {
           </div>}
           {selectedDraft.reshootPlan?.hasAlpha && <div className="alpha-source-status" role="status"><Blend size={17} /><span><strong>{selectedDraft.inputType === "images" ? t("alpha.imagesTitle") : t("alpha.videoTitle")}</strong><small>{t("reshoot.alphaDetected")}</small></span></div>}
           {selectedDraft.reshootPlan && !selectedDraft.reshootPlan.compatible && <div className="reshoot-plan incompatible"><strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : ""}</strong><span>{selectedDraft.reshootPlan.preparedWidth} × {selectedDraft.reshootPlan.preparedHeight}</span><span>{selectedDraft.reshootPlan.incompatibilityReason}</span></div>}
-          <button className="primary-action" type="button" disabled={runBusy || reshootBusy || selectedDraft.inputChecking || !selectedDraft.reshootPlan?.compatible || !store.projectsRoot || missingEngines.length > 0} onClick={() => void runReshoot()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
+          <button className="primary-action" type="button" disabled={runBusy || reshootBusy || selectedDraft.inputChecking || !selectedDraft.reshootPlan?.compatible || !store.projectsRoot || missingComponents.length > 0} onClick={() => void runReshoot()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
           {detailErrorBanner}
         </section>}
 
@@ -1830,12 +1830,12 @@ export function App() {
           </> : projectDetail ? <div className="unfinished-task-detail">
             {projectConfigurationDetails}
             {detailErrorBanner}
-            <button className="primary-action" type="button" disabled={runBusy || missingEngines.length > 0 || selectedProject.status === "running"} onClick={() => void resume(selectedProject)}><Play size={16} fill="currentColor" />{t("project.continue")}</button>
+            <button className="primary-action" type="button" disabled={runBusy || missingComponents.length > 0 || selectedProject.status === "running"} onClick={() => void resume(selectedProject)}><Play size={16} fill="currentColor" />{t("project.continue")}</button>
             {historicalTaskProgress}
           </div> : detailErrorBanner}
         </section>}
 
-        {!selectedSharedTask && selectedShowsLiveRun && <TaskProgress status={store.phase} stage={progressEvent?.stage ?? null} progress={store.progress} stageProgress={activeStageProgress} message={currentMessage} elapsedMs={liveElapsedMs} remainingSeconds={trainingRemainingSeconds} runtime={store.latestRuntime} showRuntimePanel={uiPreferences.showRuntimePanel} logs={store.events.map((event, index) => ({ key: `${event.sequence}:${index}`, timestamp: event.timestamp, source: event.engine ?? "system", level: event.level, text: event.kind === "log" ? event.message : localizePipelineMessage(locale, event.message) }))} cancelling={isCancellationRequested} onCancel={() => void requestCancellation()} logRef={liveLogRef} onLogScroll={updateLiveLogFollow} />}
+        {!selectedSharedTask && selectedShowsLiveRun && <TaskProgress status={store.phase} stage={progressEvent?.stage ?? null} progress={store.progress} stageProgress={activeStageProgress} message={currentMessage} elapsedMs={liveElapsedMs} remainingSeconds={trainingRemainingSeconds} runtime={store.latestRuntime} showRuntimePanel={uiPreferences.showRuntimePanel} logs={store.events.map((event, index) => ({ key: `${event.sequence}:${index}`, timestamp: event.timestamp, source: event.component ?? "system", level: event.level, text: event.kind === "log" ? event.message : localizePipelineMessage(locale, event.message) }))} cancelling={isCancellationRequested} onCancel={() => void requestCancellation()} logRef={liveLogRef} onLogScroll={updateLiveLogFollow} />}
 
 
       </section>

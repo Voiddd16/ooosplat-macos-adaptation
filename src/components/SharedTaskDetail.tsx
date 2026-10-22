@@ -4,7 +4,7 @@ import { cancelSharedTask, startGuiTask, readSharedTaskLogs } from '../lib/backe
 import { pipelineErrorMessage } from '../lib/pipelineError';
 import { liveTrainingRemainingSeconds } from '../lib/runtimeEstimate';
 import { taskIsActive, type SharedTask } from '../types/tasks';
-import type { ColmapAccelerationStatus, ProjectSummary } from '../types/pipeline';
+import type { AccelerationStatus, ProjectSummary } from '../types/pipeline';
 import { localizePipelineMessage, useI18n } from '../i18n';
 import { taskProjectSummary } from '../app/taskPresentation';
 import { useTaskProjectDetail } from '../app/useTaskProjectDetail';
@@ -18,7 +18,7 @@ import { ProjectResultStats } from './ProjectResultStats';
 interface Props {
   task: SharedTask;
   project?: ProjectSummary | null;
-  acceleration?: ColmapAccelerationStatus | null;
+  acceleration?: AccelerationStatus | null;
   onResume?: (project: ProjectSummary) => Promise<unknown> | void;
   showRuntimePanel?: boolean;
   canStart?: boolean;
@@ -77,8 +77,8 @@ export function SharedTaskDetail({ task, project: metadata, acceleration = null,
     : task.stage) ?? null;
   const logs = useMemo(() => {
     const rawKeys = new Set(fileLogs.map(line => `${line.source}:${line.text.trim()}`));
-    const eventLogs = events.filter(event => !['heartbeat', 'runtime'].includes(event.kind) && !rawKeys.has(`${event.engine}:${event.message.trim()}`)).map(event => ({
-      key: `event:${event.sequence}`, source: event.engine, timestamp: event.timestamp, level: event.level,
+    const eventLogs = events.filter(event => !['heartbeat', 'runtime'].includes(event.kind) && !rawKeys.has(`${event.component}:${event.message.trim()}`)).map(event => ({
+      key: `event:${event.sequence}`, source: event.component, timestamp: event.timestamp, level: event.level,
       text: event.kind === 'log' ? event.message : localizePipelineMessage(locale, event.message),
     }));
     return boundLogLines([...fileLogs, ...eventLogs]);
