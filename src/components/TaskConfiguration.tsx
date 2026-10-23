@@ -3,7 +3,7 @@ import { localizePipelineMessage, useI18n } from '../i18n';
 import { taskBasename } from '../app/taskPresentation';
 import { displayPath } from '../lib/displayPath';
 import { MediaSourceStatus } from './MediaSourceStatus';
-import type { ColmapAccelerationStatus, ImageSequenceInfo, InputType, Quality, RuntimeEstimate, VideoInfo } from '../types/pipeline';
+import type { AccelerationStatus, ImageSequenceInfo, InputType, Quality, RuntimeEstimate, VideoInfo } from '../types/pipeline';
 
 interface Props {
   sourcePath: string;
@@ -12,7 +12,7 @@ interface Props {
   quality: Quality;
   plannerEnabled: boolean;
   completed: boolean;
-  acceleration: ColmapAccelerationStatus | null;
+  acceleration: AccelerationStatus | null;
   video?: VideoInfo | null;
   imageSequence?: ImageSequenceInfo | null;
   estimatedFrames?: number | null;
@@ -24,8 +24,8 @@ interface Props {
 
 export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality, plannerEnabled, completed, acceleration, video, imageSequence, estimatedFrames, estimate, inheritedFrom, videoProjection, inputProjection }: Props) {
   const { locale, t, formatNumber, formatDuration } = useI18n();
-  const temporary = acceleration?.detectionState === 'temporarilyUnavailable';
-  const warning = acceleration?.backend === 'cpu';
+  const temporary = acceleration?.state === 'temporarilyUnavailable';
+  const warning = acceleration?.mode === 'cpu';
   const duration = video ? `${Math.floor(video.duration / 60)}:${Math.round(video.duration % 60).toString().padStart(2, '0')}` : '—';
   const visibleSourcePath = displayPath(sourcePath);
   const visibleProjectsRoot = displayPath(projectsRoot);
@@ -43,9 +43,9 @@ export function TaskConfiguration({ sourcePath, projectsRoot, inputType, quality
         <button className="planner-switch" type="button" role="switch" aria-checked={plannerEnabled} disabled><span><strong>{t('planner.label')}</strong><small>{t('planner.hint')}</small></span><i aria-hidden="true"><span /></i></button>
       </div>
     </div>
-    <div className={`acceleration-status ${temporary ? 'warning' : acceleration?.backend === 'gpu' ? 'gpu' : warning ? 'warning' : 'cpu'}`} aria-live="polite">
-      <span className="acceleration-icon">{acceleration == null ? <LoaderCircle className="spin" size={17} /> : temporary || warning ? <CircleAlert size={17} /> : acceleration.backend === 'gpu' ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
-      <span><strong>{acceleration == null ? t('gpu.detecting') : temporary ? t('gpu.temporarilyUnavailable') : acceleration.backend === 'gpu' ? t(completed ? 'gpu.enabledCompleted' : 'gpu.enabled') : t('gpu.cpu')}</strong><small>{acceleration == null ? t('gpu.reading') : temporary ? t('gpu.temporaryHint') : localizePipelineMessage(locale, acceleration.reason)}</small></span>
+    <div className={`acceleration-status ${temporary ? 'warning' : acceleration?.mode === 'gpu' ? 'gpu' : warning ? 'warning' : 'cpu'}`} aria-live="polite">
+      <span className="acceleration-icon">{acceleration == null ? <LoaderCircle className="spin" size={17} /> : temporary || warning ? <CircleAlert size={17} /> : acceleration.mode === 'gpu' ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
+      <span><strong>{acceleration == null ? t('gpu.detecting') : temporary ? t('gpu.temporarilyUnavailable') : acceleration.mode === 'gpu' ? t(completed ? 'gpu.enabledCompleted' : 'gpu.enabled') : t('gpu.cpu')}</strong><small>{acceleration == null ? t('gpu.reading') : temporary ? t('gpu.temporaryHint') : localizePipelineMessage(locale, acceleration.reason)}</small></span>
     </div>
     {(video || imageSequence) && <div className="source-metrics project-source-metrics">
       <span><small>{t(inputType === 'images' ? 'metrics.imageCount' : 'metrics.duration')}</small><b>{imageSequence ? t('common.images', { count: formatNumber(imageSequence.imageCount) }) : duration}</b></span>

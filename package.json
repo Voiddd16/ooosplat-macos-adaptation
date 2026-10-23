@@ -19,6 +19,8 @@
     "verify:telemetry:release": "node scripts/verify-telemetry-endpoint.mjs --required",
     "setup:engines": "node scripts/engine-command.mjs setup",
     "setup:brush": "node scripts/brush-runtime.mjs prepare",
+    "check:ffmpeg-abi": "node scripts/check-ffmpeg-abi.mjs",
+    "setup:media-ffmpeg": "bash scripts/setup-media-ffmpeg.sh",
     "verify:brush": "node scripts/brush-runtime.mjs verify",
     "test:brush:gpu": "node scripts/smoke-brush-runtime.mjs",
     "verify:engines": "node scripts/engine-command.mjs verify",

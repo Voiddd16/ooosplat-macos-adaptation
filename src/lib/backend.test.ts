@@ -12,7 +12,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: mocks.confirm, open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: vi.fn() }));
 
-import { probeAndPlan, prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, classifyDroppedInput, confirmSmallImageSequence, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
+import { probeAndPlan, prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,getAcceleration, classifyDroppedInput, confirmSmallImageSequence, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
 import { startPipeline } from './backend';
 
 describe("backend browser guards", () => {
@@ -58,7 +58,7 @@ describe("backend browser guards", () => {
   });
 
   it("does not invoke the acceleration command outside Tauri", async () => {
-    await expect(checkColmapAcceleration()).resolves.toBeNull();
+    await expect(getAcceleration()).resolves.toBeNull();
     expect(mocks.invoke).not.toHaveBeenCalled();
   });
 

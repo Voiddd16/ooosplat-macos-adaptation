@@ -4,7 +4,7 @@ export interface DiagnosticReport {
   timestamp: string;
   appVersion: string;
   stage: string | null;
-  engine: string | null;
+  component: string | null;
   errorCode: string;
   reason: string;
   detail: string;

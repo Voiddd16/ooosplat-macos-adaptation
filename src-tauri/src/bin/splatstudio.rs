@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use ooo_splat::{
     engines::{ffmpeg::extract_uniform_frames, ffprobe::probe_video},
+    media,
     error::{Result, SplatError},
     pipeline::runner::{default_engine_paths, PipelineRunner},
     presets::Quality,
@@ -84,7 +85,19 @@ async fn execute(cli: Cli) -> Result<()> {
                 );
             } else {
                 let video =
-                    probe_video(&engines.ffprobe, &input, None, &ProcessManager::new()).await?;
+                    media::active(media::MediaConfig {
+                        ffmpeg: Some(engines.ffmpeg.clone()),
+                        ffprobe: Some(engines.ffprobe.clone()),
+                    })
+                    .probe_video(
+                        &media::MediaContext {
+                            process_manager: &ProcessManager::new(),
+                            observer: None,
+                            log_path: None,
+                        },
+                        &input,
+                    )
+                    .await?;
                 println!("{}", serde_json::to_string_pretty(&video)?);
             }
         }
@@ -93,7 +106,19 @@ async fn execute(cli: Cli) -> Result<()> {
                 create_image_plan(&analyze_image_sequence(&input)?, &quality.preset())
             } else {
                 let video =
-                    probe_video(&engines.ffprobe, &input, None, &ProcessManager::new()).await?;
+                    media::active(media::MediaConfig {
+                        ffmpeg: Some(engines.ffmpeg.clone()),
+                        ffprobe: Some(engines.ffprobe.clone()),
+                    })
+                    .probe_video(
+                        &media::MediaContext {
+                            process_manager: &ProcessManager::new(),
+                            observer: None,
+                            log_path: None,
+                        },
+                        &input,
+                    )
+                    .await?;
                 UniformRatioFrameSelection.create_plan(&video, &quality.preset())
             };
             println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -122,9 +147,25 @@ async fn execute(cli: Cli) -> Result<()> {
                 );
                 return Ok(());
             }
+            // media-rsmpeg（进程内）：没有外部 ffmpeg/ffprobe 可执行文件要校验。
+            // health.rs 的媒体分支同理（in_process_media_status）。
+            #[cfg(not(feature = "media-rsmpeg" ))]
             ensure_engine(&engines.ffprobe)?;
+            #[cfg(not(feature = "media-rsmpeg" ))]
             ensure_engine(&engines.ffmpeg)?;
-            let video = probe_video(&engines.ffprobe, &input, None, &ProcessManager::new()).await?;
+            let video = media::active(media::MediaConfig {
+                ffmpeg: Some(engines.ffmpeg.clone()),
+                ffprobe: Some(engines.ffprobe.clone()),
+            })
+            .probe_video(
+                &media::MediaContext {
+                    process_manager: &ProcessManager::new(),
+                    observer: None,
+                    log_path: None,
+                },
+                &input,
+            )
+            .await?;
             let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
             let extraction = extract_uniform_frames(
                 &engines.ffmpeg,
@@ -192,6 +233,6 @@ fn ensure_engine(path: &std::path::Path) -> Result<()> {
     if path.is_file() {
         Ok(())
     } else {
-        Err(SplatError::EngineMissing(path.display().to_string()))
+        Err(SplatError::ComponentMissing(path.display().to_string()))
     }
 }

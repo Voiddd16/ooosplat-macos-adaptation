@@ -71,7 +71,7 @@ async fn command_help(
         })
         .await?;
     if !output.success {
-        return Err(SplatError::UnsupportedEngine(format!(
+        return Err(SplatError::UnsupportedBackend(format!(
             "COLMAP {command_name} -h 退出码 {:?}",
             output.exit_code
         )));
@@ -92,7 +92,7 @@ async fn feature_gpu_options(
     } else if help.contains("--SiftExtraction.use_gpu") {
         Ok(("--SiftExtraction.use_gpu", "--SiftExtraction.gpu_index"))
     } else {
-        Err(SplatError::UnsupportedEngine(
+        Err(SplatError::UnsupportedBackend(
             "COLMAP feature_extractor 不支持已知的 SIFT GPU 参数".into(),
         ))
     }
@@ -109,9 +109,35 @@ async fn matching_gpu_options(
     } else if help.contains("--SiftMatching.use_gpu") {
         Ok(("--SiftMatching.use_gpu", "--SiftMatching.gpu_index"))
     } else {
-        Err(SplatError::UnsupportedEngine(format!(
+        Err(SplatError::UnsupportedBackend(format!(
             "COLMAP {matcher} 不支持已知的 SIFT GPU 参数"
         )))
+    }
+}
+
+/// 后端自报的身份与能力（供 `engines::backend` 契约层使用）。
+pub fn backend_profile() -> crate::engines::backend::BackendProfile {
+    crate::engines::backend::BackendProfile {
+        identity: crate::contracts::BackendIdentity {
+            id: "colmap".into(),
+            display_name: "COLMAP".into(),
+            version: LOCKED_VERSION.to_string(),
+            family: crate::contracts::BackendFamily::ExternalCli,
+        },
+        capabilities: crate::contracts::BackendCapabilities {
+            stages: vec![
+                crate::contracts::BackendStage::FeatureExtraction,
+                crate::contracts::BackendStage::IncrementalFeatureExtraction,
+                crate::contracts::BackendStage::SequentialMatching,
+                crate::contracts::BackendStage::ExhaustiveMatching,
+                crate::contracts::BackendStage::PairMatching,
+                crate::contracts::BackendStage::SparseMapping,
+                crate::contracts::BackendStage::MappingFromExisting,
+                crate::contracts::BackendStage::IncrementalMapping,
+            ],
+            supports_loop_detection: true,
+            supports_two_view_tracks: true,
+        },
     }
 }
 
@@ -119,7 +145,7 @@ pub fn require_verified_cli(executable: &Path) -> Result<()> {
     if executable.is_file() {
         Ok(())
     } else {
-        Err(SplatError::EngineMissing(executable.display().to_string()))
+        Err(SplatError::ComponentMissing(executable.display().to_string()))
     }
 }
 

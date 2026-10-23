@@ -13,7 +13,7 @@ export interface SharedTask {
   planner_enabled: boolean; projects_root: string; status: TaskStatus; stage: PipelineEvent["stage"] | null;
   revision: number; sequence: number; created_at: string; updated_at: string; elapsed_ms: number;
   progress: number | null; estimated_progress: number | null; current: number | null; total: number | null; eta_seconds: number | null;
-  error: { code: string; message: string; failed_stage: PipelineEvent["stage"] | null; engine: string | null; exit_code: number | null; failure_id: string | null; classification: string | null; classification_is_heuristic: boolean } | null;
+  error: { code: string; message: string; failed_stage: PipelineEvent["stage"] | null; component: string | null; exit_code: number | null; failure_id: string | null; classification: string | null; classification_is_heuristic: boolean } | null;
   result: PipelineResult | null; recent_events: PipelineEvent[];
   /** UI-only count; full engine logs remain available through the log reader. */
   dropped_event_count?: number;

@@ -11,7 +11,7 @@ import { useSharedTasks } from './useSharedTasks';
 const task = (revision: number, status: SharedTask['status'] = 'running', run = 'run-1') => ({ task_id: 'task-1', run_id: run, project_id: null, revision, status, recent_events: [], result: null, error: null } as unknown as SharedTask);
 const event = (sequence: number, run = 'run-1'): PipelineEvent => ({ taskId: 'task-1', runId: run, sequence,
   revision: sequence, timestamp: '2026-10-09T00:00:00Z', kind: 'log', level: 'info', stage: 'reconstructing',
-  engine: 'colmap', progress: 50, stageProgress: null, indeterminate: true, message: `line ${sequence}`,
+  component: "reconstruction", progress: 50, stageProgress: null, indeterminate: true, message: `line ${sequence}`,
   current: null, total: null, unit: null, elapsedMs: sequence, acceleration: null });
 let root: Root, container: HTMLDivElement, handler: (event: TaskUpdate) => void;
 let latest: ReturnType<typeof useSharedTasks>;

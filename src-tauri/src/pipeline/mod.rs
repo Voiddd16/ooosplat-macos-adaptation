@@ -6,5 +6,5 @@ pub mod runner;
 pub mod runtime;
 pub mod state;
 
-pub use event::{EventKind, EventLevel, PipelineEngine, PipelineEvent};
+pub use event::{EventKind, EventLevel, PipelineComponent, PipelineEvent};
 pub use state::PipelineStage;

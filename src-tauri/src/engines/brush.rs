@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    engines::ColmapAccelerationStatus,
+    engines::AccelerationStatus,
     error::{Result, SplatError},
     presets::BrushTrainingPreset,
     process::{ProcessManager, ProcessObserver, ProcessOutput, ProcessSpec},
@@ -43,14 +43,14 @@ pub struct BrushTrainingOptions<'a> {
 }
 
 impl BrushGpuLaunchPolicy {
-    pub fn from_acceleration(acceleration: &ColmapAccelerationStatus) -> Self {
+    pub fn from_acceleration(acceleration: &AccelerationStatus) -> Self {
         Self::resolve(cfg!(windows), acceleration)
     }
 
     /// COLMAP's selected GPU is not necessarily Brush's default adapter in a
     /// multi-GPU topology. Do not give panoramas a large VRAM budget when the
     /// launch policy cannot identify the training device.
-    pub fn known_training_memory_mb(&self, acceleration: &ColmapAccelerationStatus) -> Option<u64> {
+    pub fn known_training_memory_mb(&self, acceleration: &AccelerationStatus) -> Option<u64> {
         self.expected_device_name.as_ref().and_then(|expected| {
             acceleration
                 .device
@@ -60,11 +60,11 @@ impl BrushGpuLaunchPolicy {
         })
     }
 
-    fn resolve(is_windows: bool, acceleration: &ColmapAccelerationStatus) -> Self {
+    fn resolve(is_windows: bool, acceleration: &AccelerationStatus) -> Self {
         let selected = acceleration.device.as_ref();
         let unambiguous_single_nvidia = is_windows
             && acceleration.use_gpu()
-            && acceleration.detected_nvidia_device_count == 1
+            && acceleration.detected_device_count == 1
             && selected.is_some_and(|device| device.index == 0);
         let selection_reason = if unambiguous_single_nvidia {
             "single_nvidia_discrete_gpu"
@@ -205,7 +205,7 @@ pub fn require_verified_cli(executable: &Path) -> Result<()> {
     if executable.is_file() {
         Ok(())
     } else {
-        Err(SplatError::EngineMissing(executable.display().to_string()))
+        Err(SplatError::ComponentMissing(executable.display().to_string()))
     }
 }
 
@@ -316,8 +316,8 @@ mod tests {
     use super::*;
     use crate::{
         engines::{
-            AccelerationReasonCode, AccelerationRequirements, ColmapBackend, GpuDetectionState,
-            GpuDeviceInfo,
+            AccelerationReason, AcceleratorRequirements, AccelerationMode, AccelerationState,
+            AcceleratorDevice,
         },
         presets::{resolve_brush_training_preset, Quality},
     };
@@ -329,35 +329,35 @@ mod tests {
     }
 
     fn acceleration(
-        backend: ColmapBackend,
+        backend: AccelerationMode,
         count: usize,
         index: Option<u32>,
-    ) -> ColmapAccelerationStatus {
-        ColmapAccelerationStatus {
-            backend,
-            detection_state: if backend == ColmapBackend::Gpu {
-                GpuDetectionState::Ready
+    ) -> AccelerationStatus {
+        AccelerationStatus {
+            mode: backend,
+            state: if backend == AccelerationMode::Gpu {
+                AccelerationState::Ready
             } else {
-                GpuDetectionState::Unavailable
+                AccelerationState::Unavailable
             },
-            reason_code: if backend == ColmapBackend::Gpu {
-                AccelerationReasonCode::GpuReady
+            reason_code: if backend == AccelerationMode::Gpu {
+                AccelerationReason::GpuReady
             } else {
-                AccelerationReasonCode::NoNvidiaGpu
+                AccelerationReason::NoAccelerator
             },
             reason: String::new(),
-            device: index.map(|index| GpuDeviceInfo {
+            device: index.map(|index| AcceleratorDevice {
                 index,
                 name: "NVIDIA GeForce RTX 3060 Laptop GPU".into(),
                 driver_version: "560.81".into(),
                 compute_capability: "8.6".into(),
                 total_memory_mb: Some(6_144),
             }),
-            requirements: AccelerationRequirements {
+            requirements: AcceleratorRequirements {
                 minimum_driver_version: "528.33".into(),
                 minimum_compute_capability: "5.0".into(),
             },
-            detected_nvidia_device_count: count,
+            detected_device_count: count,
         }
     }
 
@@ -374,9 +374,9 @@ mod tests {
     #[test]
     fn windows_single_nvidia_policy_forces_first_discrete_gpu_for_brush_only() {
         let policy =
-            BrushGpuLaunchPolicy::resolve(true, &acceleration(ColmapBackend::Gpu, 1, Some(0)));
+            BrushGpuLaunchPolicy::resolve(true, &acceleration(AccelerationMode::Gpu, 1, Some(0)));
         assert_eq!(
-            policy.known_training_memory_mb(&acceleration(ColmapBackend::Gpu, 1, Some(0))),
+            policy.known_training_memory_mb(&acceleration(AccelerationMode::Gpu, 1, Some(0))),
             Some(6144)
         );
         let environment = policy.environment_with_rust_log(Some("app=debug".into()));
@@ -403,9 +403,9 @@ mod tests {
     #[test]
     fn ambiguous_or_cpu_topologies_keep_automatic_device_selection() {
         for status in [
-            acceleration(ColmapBackend::Gpu, 2, Some(0)),
-            acceleration(ColmapBackend::Gpu, 1, Some(1)),
-            acceleration(ColmapBackend::Cpu, 0, None),
+            acceleration(AccelerationMode::Gpu, 2, Some(0)),
+            acceleration(AccelerationMode::Gpu, 1, Some(1)),
+            acceleration(AccelerationMode::Cpu, 0, None),
         ] {
             let policy = BrushGpuLaunchPolicy::resolve(true, &status);
             assert_eq!(policy.known_training_memory_mb(&status), None);
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn non_windows_policy_never_forces_windows_gpu_workarounds() {
         let policy =
-            BrushGpuLaunchPolicy::resolve(false, &acceleration(ColmapBackend::Gpu, 1, Some(0)));
+            BrushGpuLaunchPolicy::resolve(false, &acceleration(AccelerationMode::Gpu, 1, Some(0)));
         let environment = policy.environment_with_rust_log(None);
         assert_eq!(
             environment_value(&environment, "CUBECL_WGPU_DEFAULT_DEVICE"),

@@ -1,27 +1,42 @@
 export type Quality = "fast" | "balanced" | "high";
-export type EngineKind = "ffmpeg" | "ffprobe" | "colmap" | "brush";
+/**
+ * 承担计算的组件类别（**中性**命名）。
+ *
+ * 刻意不暴露"colmap"/"brush"这类实现名：后端换了（外部 CLI ↔ 自研进程内），
+ * 前端契约一字不改。需要知道具体是谁时，读 `BackendIdentity.displayName`。
+ */
+export type ComponentKind = "media" | "reconstruction" | "training";
 export type RunPhase = "idle" | "analyzing" | "running" | "completed" | "failed" | "cancelled";
 export type ProjectStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
 
-export type ColmapBackend = "cpu" | "gpu";
-export type GpuDetectionState = "ready" | "temporarilyUnavailable" | "unavailable";
+export type AccelerationMode = "cpu" | "gpu";
+export type AccelerationState = "ready" | "temporarilyUnavailable" | "unavailable";
+/** 加速原因码（**中性**：去掉 CUDA/NVIDIA 专属语义，原文案走 `reason`）。 */
 export type AccelerationReasonCode =
-  | "gpuReady" | "macOsCpuOnly" | "colmapUnavailable" | "colmapCudaUnavailable" | "requirementsUnavailable"
-  | "nvidiaSmiNotFound" | "probeFailed" | "probeTimeout" | "noNvidiaGpu"
+  | "gpuReady" | "cpuOnly" | "componentUnavailable" | "requirementsUnavailable"
+  | "probeFailed" | "probeTimeout" | "noAccelerator"
   | "driverVersionUnknown" | "driverTooOld" | "computeCapabilityUnknown"
   | "computeCapabilityTooLow";
-export interface GpuDeviceInfo { index: number; name: string; driverVersion: string; computeCapability: string; totalMemoryMb?: number; }
-export interface AccelerationRequirements { minimumDriverVersion: string; minimumComputeCapability: string; }
-export interface ColmapAccelerationStatus {
-  backend: ColmapBackend;
-  detectionState: GpuDetectionState;
+export interface AcceleratorDevice { index: number; name: string; driverVersion: string; computeCapability: string; totalMemoryMb?: number; }
+export interface AcceleratorRequirements { minimumDriverVersion: string; minimumComputeCapability: string; }
+export interface AccelerationStatus {
+  mode: AccelerationMode;
+  state: AccelerationState;
   reasonCode: AccelerationReasonCode;
   reason: string;
-  device: GpuDeviceInfo | null;
-  requirements: AccelerationRequirements;
-  detectedNvidiaDeviceCount?: number;
+  device: AcceleratorDevice | null;
+  requirements: AcceleratorRequirements;
+  detectedDeviceCount?: number;
 }
-export interface EngineStatus { kind: EngineKind; path: string; exists: boolean; canStart: boolean; version: string | null; cpuOnly: boolean | null; acceleration: ColmapAccelerationStatus | null; colmapCliFamily?: "legacy39" | "modern4"; detail: string; }
+export interface ComponentStatus {
+  kind: ComponentKind;
+  ready: boolean;
+  acceleration: AccelerationStatus | null;
+  detail: string;
+  location?: string;
+}
+/** 重建后端身份（`id` 稳定、`displayName` 直接展示）。 */
+export interface BackendIdentity { id: string; displayName: string; version: string; family: "externalCli" | "inProcess"; }
 export interface VideoInfo {
   duration: number;
   width: number;
@@ -120,7 +135,7 @@ export interface PipelineEvent {
   level: "info" | "warning" | "error";
   stage: string;
   substage?: string | null;
-  engine: "system" | "ffmpeg" | "colmap" | "brush" | null;
+  component: "system" | "media" | "reconstruction" | "training" | null;
   progress: number;
   stageProgress: number | null;
   indeterminate: boolean;
@@ -129,7 +144,7 @@ export interface PipelineEvent {
   total: number | null;
   unit: string | null;
   elapsedMs: number;
-  acceleration: ColmapAccelerationStatus | null;
+  acceleration: AccelerationStatus | null;
   runtime?: RuntimeSnapshot | null;
 }
 
@@ -217,7 +232,7 @@ export interface AppRuntimeStatus {
   pipelineRunElapsedMs: number;
   pipelineElapsedOffsetMs: number;
   previewProjectId: string | null;
-  taskAcceleration: ColmapAccelerationStatus | null;
+  acceleration: AccelerationStatus | null;
 }
 
 export interface ProjectTaskLogLine { source: string; message: string; }

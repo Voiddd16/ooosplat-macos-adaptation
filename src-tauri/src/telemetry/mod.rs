@@ -275,9 +275,9 @@ fn pipeline_stage_from_telemetry(stage: TelemetryStage) -> Option<PipelineStage>
 
 fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> TelemetryErrorCode {
     match error {
-        SplatError::EngineMissing(_)
+        SplatError::ComponentMissing(_)
         | SplatError::EngineStart { .. }
-        | SplatError::UnsupportedEngine(_) => TelemetryErrorCode::EngineUnavailable,
+        | SplatError::UnsupportedBackend(_) => TelemetryErrorCode::EngineUnavailable,
         SplatError::InvalidVideo(_) | SplatError::InvalidPath(_) => {
             TelemetryErrorCode::InvalidInput
         }
@@ -329,7 +329,7 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{EventLevel, PipelineEngine};
+    use crate::pipeline::{EventLevel, PipelineComponent};
 
     fn stage_event(stage: PipelineStage, stage_progress: f32) -> PipelineEvent {
         PipelineEvent {
@@ -342,7 +342,7 @@ mod tests {
             kind: EventKind::Stage,
             level: EventLevel::Info,
             stage,
-            engine: Some(PipelineEngine::System),
+            component: Some(PipelineComponent::System),
             substage: None,
             progress: stage_progress,
             stage_progress: Some(stage_progress),

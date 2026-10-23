@@ -60,7 +60,7 @@ pub struct TaskError {
     pub code: String,
     pub message: String,
     pub failed_stage: Option<PipelineStage>,
-    pub engine: Option<crate::pipeline::PipelineEngine>,
+    pub component: Option<crate::pipeline::PipelineComponent>,
     pub exit_code: Option<i32>,
     pub classification: Option<String>,
     pub classification_is_heuristic: bool,
@@ -77,7 +77,7 @@ pub struct TaskRun {
     #[serde(default)]
     pub error: Option<TaskError>,
     #[serde(default)]
-    pub last_engine: Option<crate::pipeline::PipelineEngine>,
+    pub last_component: Option<crate::pipeline::PipelineComponent>,
     #[serde(default)]
     pub last_exit_code: Option<i32>,
 }
@@ -675,7 +675,7 @@ impl TaskService {
                     code: "pipeline_failed".into(),
                     message: message.clone(),
                     failed_stage: None,
-                    engine: None,
+                    component: None,
                     exit_code: None,
                     classification: None,
                     classification_is_heuristic: false,
@@ -693,7 +693,7 @@ impl TaskService {
                     started_at: metadata.started_at.unwrap_or(metadata.created_at),
                     ended_at: Some(metadata.completed_at.unwrap_or(Utc::now())),
                     logs: registered,
-                    last_engine: None,
+                    last_component: None,
                     last_exit_code: None,
                     error: None,
                 }],
@@ -745,7 +745,7 @@ impl TaskService {
                 self.diagnostics
                     .capture(
                         error.failed_stage,
-                        error.engine,
+                        error.component,
                         error.failure_kind,
                         &error.message,
                         project,
@@ -907,7 +907,7 @@ impl TaskService {
                 started_at: Utc::now(),
                 ended_at: None,
                 logs: Default::default(),
-                last_engine: None,
+                last_component: None,
                 last_exit_code: None,
                 error: None,
             });
@@ -1140,9 +1140,9 @@ impl TaskService {
                         }
                     }
                 }
-                RunnerUpdate::ProcessExited { engine, exit_code } => {
+                RunnerUpdate::ProcessExited { component, exit_code } => {
                     if let Some(r) = t.runs.last_mut() {
-                        r.last_engine = Some(engine);
+                        r.last_component = Some(component);
                         r.last_exit_code = exit_code;
                     }
                 }
@@ -1226,7 +1226,7 @@ impl TaskService {
                     code: e.code.into(),
                     message: e.message,
                     failed_stage: e.failed_stage,
-                    engine: e.engine,
+                    component: e.component,
                     exit_code: t
                         .runs
                         .last()
@@ -1371,7 +1371,7 @@ impl TaskService {
                             "项目产物当前不可访问，可以使用现有恢复入口检查并修复".into()
                         }),
                         failed_stage: None,
-                        engine: None,
+                        component: None,
                         exit_code: None,
                         classification: None,
                         classification_is_heuristic: false,

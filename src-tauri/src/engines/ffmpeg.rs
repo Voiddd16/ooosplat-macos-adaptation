@@ -255,28 +255,21 @@ pub async fn extract_additional_frames(
     .await
 }
 
-async fn remove_selected_outputs(
+pub(crate) async fn remove_selected_outputs(
     frames: &Path,
     colmap_frames: &Path,
     masks: &Path,
     selected: &[PlannedFrame],
     has_alpha: bool,
 ) -> Result<()> {
-    let extension = if has_alpha { "png" } else { "jpg" };
+    // 与 rename_selected_outputs 同一个约定：按"是图片就算"清理，不假设扩展名
+    // （CLI 非 alpha 是 JPG，rsmpeg 是 PNG；mask 恒为 PNG，按确切名字删）。
     for frame in selected {
-        let name = format!("frame_{:010}.{extension}", frame.source_frame_index);
-        match tokio::fs::remove_file(frames.join(&name)).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        match tokio::fs::remove_file(colmap_frames.join(&name)).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        let stem = format!("frame_{:010}", frame.source_frame_index);
+        remove_pipeline_image(frames, &stem).await?;
+        remove_pipeline_image(colmap_frames, &stem).await?;
         if has_alpha {
-            match tokio::fs::remove_file(masks.join(format!("{name}.png"))).await {
+            match tokio::fs::remove_file(masks.join(format!("{stem}.png.png"))).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -286,14 +279,35 @@ async fn remove_selected_outputs(
     Ok(())
 }
 
-async fn rename_selected_outputs(
+/// 删除目录里 stem 匹配的图片（任意受支持扩展名）；不存在时静默，与旧实现一致。
+async fn remove_pipeline_image(directory: &Path, stem: &str) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_file()
+            && is_pipeline_image(&path)
+            && path.file_stem().is_some_and(|value| value == stem)
+        {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn rename_selected_outputs(
     frames: &Path,
     masks: &Path,
     selected_frames: &[PlannedFrame],
     has_alpha: bool,
 ) -> Result<()> {
-    let extension = if has_alpha { "png" } else { "jpg" };
-    let mut frame_paths = image_paths(frames, extension).await?;
+    // 与 pipeline_image_names/is_pipeline_image 用同一个允许清单，不再假设后端写出
+    // 哪种扩展名：CLI 非 alpha 写 JPG，rsmpeg（media-rsmpeg 进程内）统一写 PNG。
+    // 硬编码 JPG 会数出 0 张（真实事故：Quality v2 selected 285 frames 但 wrote 0）。
+    let mut frame_paths = pipeline_image_files(frames).await?;
     let mut selected = selected_frames.to_vec();
     selected.sort_by_key(|frame| frame.source_frame_index);
     if frame_paths.len() != selected.len() {
@@ -305,6 +319,17 @@ async fn rename_selected_outputs(
     }
     frame_paths.sort();
     for (source, frame) in frame_paths.into_iter().zip(&selected) {
+        // 重命名保留源文件自己的扩展名（源文件恒为 frame_%06d.<img> 形态）。
+        let extension = source
+            .extension()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                if has_alpha {
+                    "png".to_string()
+                } else {
+                    "jpg".to_string()
+                }
+            });
         tokio::fs::rename(
             source,
             frames.join(format!(
@@ -363,7 +388,7 @@ async fn move_image_sets(sets: &[(&Path, &Path)]) -> Result<()> {
     Ok(())
 }
 
-async fn mirror_images(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) async fn mirror_images(source: &Path, destination: &Path) -> Result<()> {
     tokio::fs::create_dir_all(destination).await?;
     let mut entries = tokio::fs::read_dir(source).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -562,7 +587,7 @@ fn frame_extraction_args(
     args
 }
 
-async fn ensure_clean_output(frames: &Path, colmap_frames: &Path, masks: &Path) -> Result<()> {
+pub(crate) async fn ensure_clean_output(frames: &Path, colmap_frames: &Path, masks: &Path) -> Result<()> {
     for directory in [frames, colmap_frames, masks] {
         if !directory.exists() {
             continue;
@@ -586,13 +611,12 @@ pub(crate) async fn validate_extraction(
     masks: &Path,
     has_alpha: bool,
 ) -> Result<FrameExtractionResult> {
-    let expected_extension = if has_alpha { "png" } else { "jpg" };
-    let frame_names = image_names(frames, expected_extension).await?;
+    let frame_names = pipeline_image_names(frames).await?;
     if frame_names.is_empty() {
         return Err(SplatError::Process("FFmpeg 未输出任何画面".into()));
     }
 
-    let colmap_names = image_names(colmap_frames, expected_extension).await?;
+    let colmap_names = pipeline_image_names(colmap_frames).await?;
     if frame_names != colmap_names {
         return Err(SplatError::Process(format!(
             "COLMAP 专用图片不完整：原始帧 {} 张，COLMAP 图片 {} 张",
@@ -696,6 +720,35 @@ async fn image_names(directory: &Path, extension: &str) -> Result<BTreeSet<Strin
                 .extension()
                 .is_some_and(|value| value.eq_ignore_ascii_case(extension))
         {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// 目录里的所有流水线图片（jpg / jpeg / png），按文件名排序。
+///
+/// 扩展名**不是**语义：外部 ffmpeg 路径写 JPEG，进程内 FFmpeg 库路径写 PNG
+/// （无损、无需额外编码器依赖）。这里按"是图片就算"来清点。
+/// [`pipeline_image_names`] 的路径版本：重命名/删除这类要逐文件操作的调用用。
+pub(crate) async fn pipeline_image_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_file() && is_pipeline_image(&path) {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+pub(crate) async fn pipeline_image_names(directory: &Path) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_file() && is_pipeline_image(&path) {
             names.insert(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -899,6 +952,48 @@ mod tests {
         validate_extraction(&frames, &colmap_frames, &masks, true)
             .await
             .unwrap();
+    }
+
+    /// rsmpeg（media-rsmpeg）无 alpha 时也写 PNG —— 共享重命名/删除必须按图像清单
+    /// 识别，不能硬编码 JPG。守门事件：Quality v2 selected 285 frames but wrote 0。
+    #[tokio::test]
+    async fn renames_and_removes_png_frames_without_alpha() {
+        let temporary = tempfile::tempdir().unwrap();
+        let frames = temporary.path().join("frames");
+        let colmap_frames = temporary.path().join("colmap_frames");
+        tokio::fs::create_dir_all(&frames).await.unwrap();
+        tokio::fs::create_dir_all(&colmap_frames).await.unwrap();
+        for index in 1..=2 {
+            image::GrayImage::from_pixel(2, 2, image::Luma([index as u8]))
+                .save(frames.join(format!("frame_{index:06}.png")))
+                .unwrap();
+        }
+        let selected = [
+            PlannedFrame {
+                source_frame_index: 7,
+                timestamp_seconds: 0.0,
+            },
+            PlannedFrame {
+                source_frame_index: 4,
+                timestamp_seconds: 0.2,
+            },
+        ];
+
+        rename_selected_outputs(&frames, &frames, &selected, false)
+            .await
+            .unwrap();
+        for name in ["frame_0000000004.png", "frame_0000000007.png"] {
+            assert!(frames.join(name).is_file(), "{name} 应保留 PNG 扩展名");
+        }
+
+        remove_selected_outputs(&frames, &colmap_frames, &frames, &selected, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            pipeline_image_names(&frames).await.unwrap().len(),
+            0,
+            "PNG 帧应按清单删除"
+        );
     }
 
     #[tokio::test]

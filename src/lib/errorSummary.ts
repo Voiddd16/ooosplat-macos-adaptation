@@ -8,8 +8,10 @@ export function errorSummaryKey(message: string): TranslationKey | null {
   if (/no space left|disk full|磁盘.*(不足|已满)/i.test(message)) return "error.summaryDisk";
   if (/access denied|permission denied|拒绝访问|权限不足/i.test(message)) return "error.summaryPermission";
   if (/timeout|timed out|超时/i.test(message)) return "error.summaryTimeout";
-  if (/brush/i.test(message)) return "error.summaryTraining";
-  if (/colmap|mapper/i.test(message)) return "error.summaryReconstruction";
+  // 分类关键词保持中性：后端换了也要能分类（COLMAP/Brush 是实现名，
+  // 重建/训练才是语义）。保留实现名作为兼容兜底。
+  if (/brush|训练|splat/i.test(message)) return "error.summaryTraining";
+  if (/colmap|mapper|重建|三角化|配准|稀疏/i.test(message)) return "error.summaryReconstruction";
   if (/ffprobe|ffmpeg/i.test(message)) return "error.summaryMedia";
   if (/no such file|file not found|文件.*(不存在|找不到)/i.test(message)) return "error.summaryFile";
   return null;

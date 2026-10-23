@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    engines::ColmapBackend,
+    engines::AccelerationMode,
     pipeline::PipelineStage,
     planner::BridgeBackfillStatus,
     presets::{BrushTrainingProfile, ResolvedBrushTrainingPreset},
@@ -46,7 +46,7 @@ pub struct PlannerInitialReconstructionMetrics {
     pub input_images: u64,
     pub registered_images: u64,
     pub points_3d: u64,
-    pub backend: ColmapBackend,
+    pub backend: AccelerationMode,
     pub allow_two_view_tracks: bool,
 }
 

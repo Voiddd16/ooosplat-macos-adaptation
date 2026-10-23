@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { ColmapAccelerationStatus, EngineStatus, FramePlan, ImageSequenceInfo, InputType, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, RuntimeEstimate, RuntimeSnapshot, VideoInfo } from "../types/pipeline";
+import type { AccelerationStatus, ComponentStatus, FramePlan, ImageSequenceInfo, InputType, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, RuntimeEstimate, RuntimeSnapshot, VideoInfo } from "../types/pipeline";
 import type { SharedTask } from "../types/tasks";
 import { changesOperation, isProgressEvent, staleOperation } from '../lib/progressState';
 
@@ -10,13 +10,13 @@ interface AppState {
   plannerEnabled: boolean;
   projects: ProjectSummary[];
   quality: Quality;
-  colmapAcceleration: ColmapAccelerationStatus | null;
-  taskColmapAcceleration: ColmapAccelerationStatus | null;
+  acceleration: AccelerationStatus | null;
+  taskAcceleration: AccelerationStatus | null;
   video: VideoInfo | null;
   imageSequence: ImageSequenceInfo | null;
   plan: FramePlan | null;
   estimate: RuntimeEstimate | null;
-  engines: EngineStatus[];
+  components: ComponentStatus[];
   phase: RunPhase;
   progress: number;
   progressMessage: string;
@@ -33,11 +33,11 @@ interface AppState {
   setPlannerEnabled: (enabled: boolean) => void;
   setProjects: (projects: ProjectSummary[]) => void;
   setQuality: (quality: Quality) => void;
-  setColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
-  setTaskColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
+  setAcceleration: (acceleration: AccelerationStatus | null) => void;
+  setTaskAcceleration: (acceleration: AccelerationStatus | null) => void;
   setAnalysis: (inputType: InputType, video: VideoInfo | null, imageSequence: ImageSequenceInfo | null, plan: FramePlan, estimate: RuntimeEstimate) => void;
   setEstimate: (estimate: RuntimeEstimate | null) => void;
-  setEngines: (engines: EngineStatus[]) => void;
+  setComponents: (components: ComponentStatus[]) => void;
   setPhase: (phase: RunPhase) => void;
   beginRun: () => void;
   receiveEvent: (event: PipelineEvent) => void;
@@ -73,7 +73,7 @@ function reduceEvents(state: AppState, batch: PipelineEvent[]): AppState {
       lastEventSequence: event.sequence,
       progress: terminal ? next.progress : Math.max(next.progress, Math.min(event.stage === 'completed' ? 100 : 99.9, event.progress)),
       progressMessage: progressEvent ? event.message : next.progressMessage,
-      taskColmapAcceleration: event.acceleration ?? next.taskColmapAcceleration,
+      taskAcceleration: event.acceleration ?? next.taskAcceleration,
     };
   }
   return logs ? { ...next, events: logs.slice(-500) } : next;
@@ -82,7 +82,7 @@ function reduceEvents(state: AppState, batch: PipelineEvent[]): AppState {
 const newRunState = {
   phase: "running" as const, progress: 0, progressMessage: "正在创建项目", latestEvent: null,
   latestRuntime: null, lastEventSequence: 0, events: [] as PipelineEvent[], result: null,
-  error: null, errorAt: null, taskColmapAcceleration: null, liveTask: null,
+  error: null, errorAt: null, taskAcceleration: null, liveTask: null,
 };
 
 export const useAppStore = create<AppState>((set) => ({
@@ -92,13 +92,13 @@ export const useAppStore = create<AppState>((set) => ({
   plannerEnabled: true,
   projects: [],
   quality: "balanced",
-  colmapAcceleration: null,
-  taskColmapAcceleration: null,
+  acceleration: null,
+  taskAcceleration: null,
   video: null,
   imageSequence: null,
   plan: null,
   estimate: null,
-  engines: [],
+  components: [],
   phase: "idle",
   progress: 0,
   progressMessage: "",
@@ -135,11 +135,11 @@ export const useAppStore = create<AppState>((set) => ({
     : { plannerEnabled, plan: null, estimate: null, result: null, error: null, errorAt: null }),
   setProjects: (projects) => set({ projects }),
   setQuality: (quality) => set({ quality, plan: null, estimate: null, result: null, error: null, errorAt: null }),
-  setColmapAcceleration: (colmapAcceleration) => set({ colmapAcceleration }),
-  setTaskColmapAcceleration: (taskColmapAcceleration) => set({ taskColmapAcceleration }),
+  setAcceleration: (acceleration) => set({ acceleration }),
+  setTaskAcceleration: (taskAcceleration) => set({ taskAcceleration }),
   setAnalysis: (inputType, video, imageSequence, plan, estimate) => set({ inputType, video, imageSequence, plan, estimate }),
   setEstimate: (estimate) => set({ estimate }),
-  setEngines: (engines) => set({ engines }),
+  setComponents: (components) => set({ components }),
   setPhase: (phase) => set({ phase }),
   beginRun: () => set(newRunState),
   receiveEvent: (event) => set((state) => reduceEvents(state, [event])),

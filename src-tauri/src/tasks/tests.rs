@@ -26,7 +26,7 @@ fn notification_run(service: &TaskService, id: Uuid) -> Uuid {
         started_at: Utc::now(),
         ended_at: None,
         logs: Default::default(),
-        last_engine: None,
+        last_component: None,
         last_exit_code: None,
         error: None,
     });
@@ -1026,7 +1026,7 @@ async fn logs_are_bounded_incremental_and_detect_rewrite_and_wrong_execution() {
         started_at: Utc::now(),
         ended_at: None,
         logs: BTreeMap::from([("brush".into(), logs::register(&logroot, &path, 0).unwrap())]),
-        last_engine: None,
+        last_component: None,
         last_exit_code: None,
         error: None,
     });
@@ -1108,7 +1108,7 @@ async fn cursors_do_not_leak_redacted_text_and_reject_cross_task_access() {
         started_at: Utc::now(),
         ended_at: Some(Utc::now()),
         logs: BTreeMap::from([("brush".into(), logs::register(&logroot, &path, 0).unwrap())]),
-        last_engine: None,
+        last_component: None,
         last_exit_code: None,
         error: None,
     });
@@ -1243,7 +1243,7 @@ fn write_planner_fixture(
     complete: bool,
 ) -> crate::project::ProjectOutput {
     use crate::{
-        engines::ColmapAccelerationStatus,
+        engines::AccelerationStatus,
         presets::resolve_brush_training_preset,
         project::{FrameState, PipelineStateFile, ProjectInputType, ReshootState},
         reconstruction::validator::{ReconstructionQuality, ReconstructionReport},
@@ -1327,9 +1327,9 @@ fn write_planner_fixture(
     let state: PipelineStateFile =
         serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
     runner.record_frame_metrics(&state, selected, None);
-    let acceleration: ColmapAccelerationStatus = serde_json::from_value(serde_json::json!({
-        "backend": "gpu", "detectionState": "ready", "reasonCode": "gpuReady",
-        "reason": "fixture", "device": null, "detectedNvidiaDeviceCount": 1,
+    let acceleration: AccelerationStatus = serde_json::from_value(serde_json::json!({
+        "mode": "gpu", "state": "ready", "reasonCode": "gpuReady",
+        "reason": "fixture", "device": null, "detectedDeviceCount": 1,
         "requirements": { "minimumDriverVersion": "580", "minimumComputeCapability": "7.5" }
     }))
     .unwrap();
@@ -1610,7 +1610,7 @@ async fn log_cursor_authentication_rotation_and_global_line_limit_are_enforced()
             ),
         ]),
         error: None,
-        last_engine: None,
+        last_component: None,
         last_exit_code: None,
     });
     let request = logs::LogRequest {

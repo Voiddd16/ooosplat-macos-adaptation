@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createDiagnosticReportHandler, createReportRateLimiter, validateDiagnosticReport, MAX_REPORT_BYTES } from "./report.ts";
 
 function fixture() {
-  return { schemaVersion: 1, reportId: "11111111-1111-4111-8111-111111111111", timestamp: "2026-10-02T08:00:00Z", appVersion: "0.5.0", stage: "matching", engine: "colmap", errorCode: "pipeline_failed", reason: "Could not finish", detail: "early eof [REDACTED]", logTail: "last error", logsTruncated: false, environment: { system: { name: "Windows 11", version: "10.0", arch: "x86_64" }, gpus: [{ name: "Intel", driverVersion: "1", totalMemoryMb: null, computeCapability: null }, { name: "NVIDIA", driverVersion: "2", totalMemoryMb: 8192, computeCapability: "8.6" }], actualDevice: "NVIDIA" } };
+  return { schemaVersion: 1, reportId: "11111111-1111-4111-8111-111111111111", timestamp: "2026-10-02T08:00:00Z", appVersion: "0.5.0", stage: "matching", component: "reconstruction", errorCode: "pipeline_failed", reason: "Could not finish", detail: "early eof [REDACTED]", logTail: "last error", logsTruncated: false, environment: { system: { name: "Windows 11", version: "10.0", arch: "x86_64" }, gpus: [{ name: "Intel", driverVersion: "1", totalMemoryMb: null, computeCapability: null }, { name: "NVIDIA", driverVersion: "2", totalMemoryMb: 8192, computeCapability: "8.6" }], actualDevice: "NVIDIA" } };
 }
 function request(value: unknown) { return new Request("https://example.invalid/api/telemetry/event", { method: "POST", headers: { "Content-Type": "application/json", "X-OOOSplat-Report": "diagnostic-v1" }, body: JSON.stringify(value) }); }
 

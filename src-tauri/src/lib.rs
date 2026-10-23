@@ -1,10 +1,12 @@
 #![recursion_limit = "256"]
 
 pub mod commands;
+pub mod contracts;
 pub mod diagnostics;
 pub mod engines;
 pub mod error;
 pub mod imports;
+pub mod media;
 pub mod mcp;
 pub mod pipeline;
 pub mod planner;
@@ -63,8 +65,8 @@ pub fn run_app() {
         .manage(mcp::McpController::default())
         .invoke_handler(tauri::generate_handler![
             updates::check_app_update,
-            commands::check_engines,
-            commands::check_colmap_acceleration,
+            commands::check_components,
+            commands::get_acceleration,
             commands::probe_and_plan,
             commands::analyze_input,
             commands::classify_dropped_input,
