@@ -1,0 +1,36 @@
+[package]
+name = "brush-sort"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+brush-cube.path = "../brush-cube"
+brush-scan.path = "../brush-scan"
+burn.workspace = true
+bytemuck = { workspace = true, features = ["derive"] }
+burn-wgpu.workspace = true
+burn-cubecl.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytemuck = { workspace = true, features = ["derive"] }
+divan = "0.1.17"
+rand.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+wasm-bindgen-test = "0.3"
+
+[[bench]]
+name = "sort_bench"
+harness = false
+path = "benches/sort_bench.rs"
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[package.metadata.cargo-shear]
+ignored = ["bytemuck", "getrandom"]
+
+[lints]
+workspace = true

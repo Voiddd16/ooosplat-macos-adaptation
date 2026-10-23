@@ -1,0 +1,216 @@
+#![recursion_limit = "256"]
+
+use burn::nn::PaddingConfig2d;
+use burn::nn::conv::Conv2d;
+use burn::nn::conv::Conv2dConfig;
+use burn::nn::pool::MaxPool2d;
+use burn::nn::pool::MaxPool2dConfig;
+use burn::tensor::Device;
+use burn::tensor::activation::relu;
+use burn::{config::Config, module::Module, tensor::Tensor};
+
+/// Residual layer block configuration.
+#[derive(Config, Debug)]
+struct VggBlockConfig {
+    num_blocks: usize,
+    in_channels: usize,
+    out_channels: usize,
+}
+
+impl VggBlockConfig {
+    /// Initialize a new `LayerBlock` module.
+    fn init(&self, device: &Device) -> VggBlock {
+        let convs = (0..self.num_blocks)
+            .map(|b| {
+                let in_channels = if b == 0 {
+                    self.in_channels
+                } else {
+                    self.out_channels
+                };
+
+                // conv3x3
+                let conv = Conv2dConfig::new([in_channels, self.out_channels], [3, 3])
+                    .with_stride([1, 1])
+                    .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                    .with_bias(true);
+                conv.init(device)
+            })
+            .collect();
+
+        VggBlock { convs }
+    }
+}
+
+#[derive(Module, Debug)]
+struct VggBlock {
+    convs: Vec<Conv2d>,
+}
+
+impl VggBlock {
+    pub(crate) fn forward(&self, input: Tensor<4>) -> Tensor<4> {
+        let mut cur = input;
+        for conv in &self.convs {
+            cur = relu(conv.forward(cur));
+        }
+        cur
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct LpipsModel {
+    blocks: Vec<VggBlock>,
+    heads: Vec<Conv2d>,
+    max_pool: MaxPool2d,
+}
+
+fn norm_vec(vec: Tensor<4>) -> Tensor<4> {
+    let norm_factor = vec.clone().powi_scalar(2).sum_dim(1).sqrt();
+    vec / (norm_factor + 1e-10)
+}
+
+impl LpipsModel {
+    /// Calculate the lpips. Imgs are in NCHW order. Inputs should be 0-1 normalised.
+    pub fn lpips(&self, imgs_a: Tensor<4>, imgs_b: Tensor<4>) -> Tensor<1> {
+        let device = imgs_a.device();
+
+        // Convert NHWC to NCHW and to [-1, 1].
+        let imgs_a = imgs_a.permute([0, 3, 1, 2]) * 2.0 - 1.0;
+        let imgs_b = imgs_b.permute([0, 3, 1, 2]) * 2.0 - 1.0;
+
+        let shift =
+            Tensor::<1>::from_floats([-0.030, -0.088, -0.188], &device).reshape([1, 3, 1, 1]);
+        let scale = Tensor::<1>::from_floats([0.458, 0.448, 0.450], &device).reshape([1, 3, 1, 1]);
+
+        let mut imgs_a = (imgs_a - shift.clone()) / scale.clone();
+        let mut imgs_b = (imgs_b - shift) / scale;
+
+        let mut loss = Tensor::<1>::zeros([1], &device);
+        for (i, (block, head)) in self.blocks.iter().zip(&self.heads).enumerate() {
+            // TODO: concatenating first might be faster.
+            if i != 0 {
+                imgs_a = self.max_pool.forward(imgs_a);
+                imgs_b = self.max_pool.forward(imgs_b);
+            }
+
+            // Process each part through the block
+            imgs_a = block.forward(imgs_a);
+            imgs_b = block.forward(imgs_b);
+
+            let normed_a = norm_vec(imgs_a.clone());
+            let normed_b = norm_vec(imgs_b.clone());
+
+            let diff = (normed_a - normed_b).powi_scalar(2);
+            let class = head.forward(diff);
+            // Add spatial mean.
+            loss = loss + class.mean_dim(2).mean_dim(3).reshape([1]);
+        }
+        loss
+    }
+}
+
+impl LpipsModel {
+    pub fn new(device: &Device) -> Self {
+        // Could have different variations here but just doing VGG for now.
+        let blocks = [
+            (2, 3, 64),
+            (2, 64, 128),
+            (3, 128, 256),
+            (3, 256, 512),
+            (3, 512, 512),
+        ]
+        .iter()
+        .map(|&(num_blocks, in_channels, out_channels)| {
+            VggBlockConfig::new(num_blocks, in_channels, out_channels).init(device)
+        })
+        .collect();
+
+        let heads = [64, 128, 256, 512, 512]
+            .iter()
+            .map(|&channels| {
+                Conv2dConfig::new([channels, 1], [1, 1])
+                    .with_stride([1, 1])
+                    .with_bias(false)
+                    .init(device)
+            })
+            .collect();
+
+        Self {
+            blocks,
+            heads,
+            max_pool: MaxPool2dConfig::new([2, 2]).with_strides([2, 2]).init(),
+        }
+    }
+}
+
+pub fn load_vgg_lpips(device: &Device) -> LpipsModel {
+    use burn::store::ModuleRecord;
+    use burn::tensor::Bytes;
+    let model = LpipsModel::new(device);
+
+    // Weights are stored as f16 burnpack; cast up to the model's f32 on load.
+    #[allow(clippy::large_include_file)]
+    static PACKED_WEIGHTS: &[u8] = include_bytes!("../burn_mapped.bpk");
+
+    let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(PACKED_WEIGHTS.to_vec()))
+        .expect("Should decode packed weights")
+        .cast_to_module_dtype();
+    model.load_record(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_vgg_lpips;
+    use burn::tensor::{Device, Tensor, TensorData};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[cfg(target_family = "wasm")]
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    static APPLE_PNG: &[u8] = include_bytes!("../apple.png");
+    static PEAR_PNG: &[u8] = include_bytes!("../pear.png");
+
+    fn image_to_tensor(device: &Device, img: &image::DynamicImage) -> Tensor<4> {
+        let rgb_img = img.to_rgb32f();
+        let (w, h) = rgb_img.dimensions();
+        let data = TensorData::new(rgb_img.into_vec(), [1, h as usize, w as usize, 3]);
+        Tensor::from_data(data, device)
+    }
+
+    async fn read_scalar(t: Tensor<1>) -> f32 {
+        t.into_scalar_async::<f32>().await.expect("readback")
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_structural_properties() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let image1 = image::load_from_memory(APPLE_PNG).expect("Failed to load apple.png");
+        let image2 = image::load_from_memory(PEAR_PNG).expect("Failed to load pear.png");
+        let apple = image_to_tensor(&device, &image1);
+        let pear = image_to_tensor(&device, &image2);
+        let model = load_vgg_lpips(&device);
+
+        // Identity: LPIPS(x, x) == 0.
+        let identity = read_scalar(model.lpips(apple.clone(), apple.clone())).await;
+        assert!(identity.abs() < 1e-5, "LPIPS(apple, apple) = {identity}");
+
+        // Symmetry: LPIPS(a, b) == LPIPS(b, a).
+        let ab = read_scalar(model.lpips(apple.clone(), pear.clone())).await;
+        let ba = read_scalar(model.lpips(pear, apple)).await;
+        assert!((ab - ba).abs() < 1e-5, "asymmetric: ab = {ab}, ba = {ba}");
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_matches_pytorch_reference() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let image1 = image::load_from_memory(APPLE_PNG).expect("Failed to load apple.png");
+        let image2 = image::load_from_memory(PEAR_PNG).expect("Failed to load pear.png");
+        let apple = image_to_tensor(&device, &image1);
+        let pear = image_to_tensor(&device, &image2);
+        let model = load_vgg_lpips(&device);
+        let score = read_scalar(model.lpips(apple, pear)).await;
+        assert!(
+            (score - 0.657_102).abs() < 1e-4,
+            "LPIPS(apple, pear) = {score}, PyTorch reference 0.6571019887924194",
+        );
+    }
+}

@@ -1,0 +1,94 @@
+#![recursion_limit = "256"]
+
+use burn::backend::Backend;
+use burn::backend::tensor::FloatTensor;
+use camera::Camera;
+use clap::ValueEnum;
+use glam::Vec3;
+
+use crate::gaussian_splats::SplatRenderMode;
+pub use crate::gaussian_splats::{Splats, TextureMode, render_splats};
+pub use crate::render_aux::{RenderAux, RenderAuxInner, RenderOutput};
+
+pub mod burn_glue;
+pub mod bwd;
+#[doc(hidden)]
+pub mod dim_check;
+mod fusion;
+#[doc(hidden)]
+pub mod kernels;
+pub mod render_aux;
+pub mod shaders;
+
+pub mod sh;
+
+#[cfg(test)]
+mod tests;
+
+pub mod bounding_box;
+pub mod camera;
+pub mod gaussian_splats;
+#[doc(hidden)]
+pub mod get_tile_offset;
+pub mod render;
+pub mod validation;
+
+macro_rules! backend_kind {
+    ($($t:tt)*) => { ::burn::backend::DispatchTensorKind::Cube($($t)*) };
+}
+pub(crate) use backend_kind;
+
+/// Trait for the gaussian splatting rendering pipeline.
+///
+/// A single call performs: cull → readback → rasterize.
+///
+/// `#[backend_extension(Wgpu)]` generates `impl SplatOps for Dispatch`, which
+/// unwraps the type-erased `Tensor<D>` dispatch primitives to the concrete
+/// Wgpu backend, calls the hand-written `impl SplatOps for Wgpu`, and re-wraps
+/// the `RenderOutput` via its `ExtensionType` derive. Only the non-autodiff
+/// arm is generated: the differentiable path is a hand-rolled `Backward` in
+/// `brush-render-bwd` and never dispatches `render` through `Autodiff`.
+#[burn::backend::backend_extension(Cube, Autodiff)]
+pub trait SplatOps: Backend {
+    /// Render gaussian splats to an image.
+    ///
+    /// Full forward pipeline: cull, depth sort, readback, project, rasterize.
+    ///
+    /// `refine_weight` and `coeffs_grad_sq` are zero-filled accumulators that
+    /// catch per-splat bookkeeping the backward produces: the refinement
+    /// weight gradient, and the mean square of each splat's SH gradient, which
+    /// the optimizer wants reduced and would otherwise square a full
+    /// `[N, coeffs, 3]` tensor to get. Only the `Autodiff` impl writes them;
+    /// the concrete backends ignore both.
+    /// `min_scale` is the per-splat Mip-Splatting scale floor `[N]`, folded
+    /// into scales and opacity inside the projection kernels (and their
+    /// backward). With `has_min_scale` false it is a placeholder the kernels
+    /// never read; [`Splats::min_scale_arg`] builds the pair.
+    /// `pass` picks forward-only vs. forward+backward-bookkeeping, and (only
+    /// for tests) toggles the C^1 smoothstep around the alpha cutoff.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        camera: &Camera,
+        img_size: glam::UVec2,
+        transforms: FloatTensor<Self>,
+        sh_coeffs: FloatTensor<Self>,
+        raw_opacities: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
+        refine_weight: FloatTensor<Self>,
+        coeffs_grad_sq: FloatTensor<Self>,
+        render_mode: SplatRenderMode,
+        background: Vec3,
+        pass: gaussian_splats::RasterPass,
+    ) -> impl Future<Output = RenderOutput<Self>>;
+}
+
+#[derive(
+    Default, ValueEnum, Clone, Copy, Eq, PartialEq, Debug, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum AlphaMode {
+    #[default]
+    Masked,
+    Transparent,
+}

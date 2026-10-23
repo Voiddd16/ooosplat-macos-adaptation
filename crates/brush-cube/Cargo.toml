@@ -1,0 +1,35 @@
+[package]
+name = "brush-cube"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+# Provides `DeviceOps` for `WgpuDevice` in standalone builds.
+burn = { workspace = true, features = ["wgpu"] }
+burn-cubecl.workspace = true
+burn-wgpu.workspace = true
+bytemuck = { workspace = true, features = ["derive"] }
+log.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+console_error_panic_hook = "0.1"
+wasm-logger = "0.2"
+
+[lints]
+workspace = true
+
+[features]
+# Compile kernels to MSL instead of going through wgpu's WGSL frontend.
+# macOS only, and opt-in on purpose:
+#
+#  * burn switches bool storage to u8 as soon as this is on, but cubecl picks
+#    the shader compiler at runtime and needs MTLGPUFamily::Apple7 plus a
+#    Metal compiler >= 3.2. A GPU that fails that check (a paravirtual one,
+#    say) falls back to WGSL, which has no u8 type, and every kernel touching
+#    a bool fails to compile.
+#  * CI runners are exactly that case, so they build without this.
+#
+# Use it on real hardware: `cargo test --features brush-cube/metal`.
+metal = ["burn-wgpu/metal"]

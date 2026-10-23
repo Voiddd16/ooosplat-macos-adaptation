@@ -1,0 +1,1273 @@
+//! Image-loss kernels for Brush.
+//!
+//! GT lives on the GPU as a `Tensor<u32>` of shape `[H, W]`, where each u32
+//! packs `[r8, g8, b8, a8]` (LSB → MSB). Conversion to f32 happens inside
+//! the kernels via shift-and-divide-by-255. No f32 GT image is ever
+//! materialised on the autograd tape.
+//!
+//! Public surface:
+//! - [`image_loss`]: mean of `l1_w * |pred - gt_eff| + ssim_w * ssim(pred,
+//!   gt_eff)` over the RGB pixels, plus an optional weighted alpha-match
+//!   term, with optional background-compositing of GT (`gt_eff = gt + (1 -
+//!   gt.a) * bg`) and optional mask multiplication (`out = out * gt.a`)
+//!   folded into the kernel. The differentiable entry; the kernel reduces
+//!   its own 16×16 tiles so the per-pixel map never touches memory.
+//! - [`image_loss_eval`]: forward-only per-pixel loss map, for eval.
+//! - [`psnr_from_mse`] / [`psnr`]: PSNR in dB, with MSE floored so identical
+//!   images report 100 dB rather than infinity.
+//!
+//! Backward recomputes SSIM partials inline so no per-pixel state survives
+//! across the autograd tape.
+
+use brush_cube::create_tensor;
+use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
+use burn::backend::{Autodiff, AutodiffBackend};
+use burn::{
+    backend::{
+        Backend, TensorMetadata,
+        autodiff::{
+            checkpoint::{base::Checkpointer, strategy::NoCheckpointing},
+            grads::Gradients,
+            ops::{Backward, Ops, OpsKind},
+        },
+        tensor::{FloatTensor, IntTensor},
+    },
+    tensor::{DType, Int, Shape, Tensor},
+};
+use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
+use glam::Vec3;
+
+mod kernels {
+    use burn::cubecl;
+    use burn::cubecl::cube;
+    use burn::cubecl::frontend::CompilationArg;
+    use burn::cubecl::frontend::IndexMutExpand;
+    use burn::cubecl::prelude::*;
+
+    /// 11-tap Gaussian weights at sigma = 1.5, normalised to sum to 1.
+    /// Called from `comptime!` so it runs once per kernel build, baking each
+    /// weight as an f32 literal into the generated kernel.
+    fn gauss_taps() -> [f32; 11] {
+        let sigma = 1.5_f32;
+        let mut w = [0.0_f32; 11];
+        let mut sum = 0.0;
+        for (i, w) in w.iter_mut().enumerate() {
+            let x = i as f32 - 5.0;
+            *w = (-x * x / (2.0 * sigma * sigma)).exp();
+            sum += *w;
+        }
+        for w in &mut w {
+            *w /= sum;
+        }
+        w
+    }
+
+    pub const BLOCK_X: u32 = 16;
+    pub const BLOCK_Y: u32 = 16;
+    const HALO: u32 = 5;
+    const SHARED_X: u32 = BLOCK_X + 2 * HALO; // 26
+    const SHARED_Y: u32 = BLOCK_Y + 2 * HALO; // 26
+    // The backward kernel uses a smaller tile than the forward. Its inner
+    // blur of an already-blurred quantity widens the loaded `(pred, gt_eff)`
+    // footprint by another HALO on each side, so a 16x16 tile would need
+    // ~28 KiB of f32 shared memory; cubecl-wgpu's shared-memory limit check
+    // pessimistically doubles that and rejects the launch on Apple's 32 KiB
+    // threadgroup budget. Shrinking the tile to 8x8 fits inside the doubled
+    // bound. Forward is unaffected and stays at 16x16.
+    pub const BLOCK_X_BWD: u32 = 8;
+    pub const BLOCK_Y_BWD: u32 = 8;
+    const SHARED_X_BWD: u32 = BLOCK_X_BWD + 2 * HALO; // 18
+    const SHARED_Y_BWD: u32 = BLOCK_Y_BWD + 2 * HALO; // 18
+    const EXT_X_BWD: u32 = BLOCK_X_BWD + 4 * HALO; // 28
+    const EXT_Y_BWD: u32 = BLOCK_Y_BWD + 4 * HALO; // 28
+    // Loop trip counts for cooperative loads/stores. Each phase needs at
+    // least `ceil(footprint / threads)` iterations.
+    const THREADS_BWD: u32 = BLOCK_X_BWD * BLOCK_Y_BWD;
+    const LOAD_ITERS_BWD: u32 = (EXT_Y_BWD * EXT_X_BWD).div_ceil(THREADS_BWD); // 13
+    const HBLUR_ITERS_BWD: u32 = (EXT_Y_BWD * SHARED_X_BWD).div_ceil(THREADS_BWD); // 8
+    const PARTIAL_ITERS_BWD: u32 = (SHARED_Y_BWD * SHARED_X_BWD).div_ceil(THREADS_BWD); // 6
+    const INNER_H_PASSES_BWD: u32 = SHARED_Y_BWD.div_ceil(BLOCK_Y_BWD); // 3
+
+    const C1: f32 = 0.01 * 0.01;
+    const C2: f32 = 0.03 * 0.03;
+    const INV_255: f32 = 1.0 / 255.0;
+
+    /// Read `pred[y, x, c]` (`[H, W, C]` layout, `cn` channels) returning
+    /// zero for out-of-bounds. The
+    /// `if/else` form generated a non-uniform branch that Naga's MSL
+    /// backend tracked into the post-load `workgroupBarrier()`; we use
+    /// `select` to keep control flow uniform. The read always executes —
+    /// for OOB threads `(y, x) = (0, 0)` (see `coords`), so the index
+    /// `c` is always in-bounds.
+    #[cube]
+    fn read_pred<F: Float>(
+        pred: &Tensor<F>,
+        c: u32,
+        y: u32,
+        x: u32,
+        oob: bool,
+        cn: u32,
+        w: u32,
+    ) -> F {
+        let v = pred[((y * w + x) * cn + c) as usize];
+        select(oob, F::cast_from(0.0_f32), v)
+    }
+
+    /// Sum of `value` over the 16x16 forward tile. A shared-memory tree
+    /// rather than plane ops: WGSL only allows subgroup builtins in
+    /// one-dimensional workgroups, and this kernel's is 2D.
+    #[cube]
+    fn tile_sum<F: Float>(value: F) -> F {
+        let mut buf = Shared::new_slice((BLOCK_X * BLOCK_Y) as usize);
+        let tid = UNIT_POS_Y * BLOCK_X + UNIT_POS_X;
+        buf[tid as usize] = value;
+        sync_cube();
+        #[unroll]
+        for s in 0u32..8u32 {
+            let stride = 128u32 >> s;
+            if tid < stride {
+                let other = buf[(tid + stride) as usize];
+                buf[tid as usize] += other;
+            }
+            sync_cube();
+        }
+        buf[0]
+    }
+
+    /// Number of forward tiles across the image; partial sums are laid out
+    /// `[4, tiles_y * tiles_x]` in forward-tile order.
+    #[cube]
+    #[allow(clippy::manual_div_ceil)]
+    fn tiles_x(w: u32) -> u32 {
+        (w + BLOCK_X - 1u32) / BLOCK_X
+    }
+
+    #[cube]
+    #[allow(clippy::manual_div_ceil)]
+    fn num_tiles(h: u32, w: u32) -> u32 {
+        tiles_x(w) * ((h + BLOCK_Y - 1u32) / BLOCK_Y)
+    }
+
+    /// Upstream gradient for channel `c` at pixel `(y, x)`: the gradient of
+    /// the loss w.r.t. that pixel's forward-tile partial sum, times the
+    /// channel weight the forward folded into that sum.
+    #[cube]
+    #[allow(clippy::too_many_arguments)]
+    fn chain_at<F: Float>(
+        dl_dpartials: &Tensor<F>,
+        c: u32,
+        y: u32,
+        x: u32,
+        h: u32,
+        w: u32,
+        weight: F,
+    ) -> F {
+        let tile = (y / BLOCK_Y) * tiles_x(w) + x / BLOCK_X;
+        dl_dpartials[(c * num_tiles(h, w) + tile) as usize] * weight
+    }
+
+    /// Read one `[r8 g8 b8 a8]`-packed pixel from `gt_packed`. Returns the
+    /// requested colour byte and the alpha byte, both in `[0, 1]`. The alpha
+    /// is always returned so it's available for compositing or masking when
+    /// those flags are on. As with `read_pred`, the body runs unconditionally
+    /// and `oob` is folded in via `select` so we don't emit a non-uniform
+    /// branch before a workgroup barrier.
+    #[cube]
+    fn read_gt<F: Float>(
+        gt_packed: &Tensor<u32>,
+        c: u32,
+        y: u32,
+        x: u32,
+        oob: bool,
+        w: u32,
+    ) -> (F, F) {
+        let val = gt_packed[(y * w + x) as usize];
+        let byte_c = f32::cast_from((val >> (c * 8u32)) & 0xffu32);
+        let byte_a = f32::cast_from((val >> 24u32) & 0xffu32);
+        let zero = F::cast_from(0.0_f32);
+        let gt_c = F::cast_from(byte_c * INV_255);
+        let gt_a = F::cast_from(byte_a * INV_255);
+        (select(oob, zero, gt_c), select(oob, zero, gt_a))
+    }
+
+    /// Map a tile-local position offset by `halo` to global image coords.
+    #[cube]
+    fn coords(
+        tile_y0: u32,
+        tile_x0: u32,
+        local_y: u32,
+        local_x: u32,
+        #[comptime] halo: u32,
+        h: u32,
+        w: u32,
+    ) -> (u32, u32, bool) {
+        let total_y = tile_y0 + local_y;
+        let total_x = tile_x0 + local_x;
+        let oob_under = total_y < halo || total_x < halo;
+        let zero = u32::cast_from(0u32);
+        let gy = select(oob_under, zero, total_y - halo);
+        let gx = select(oob_under, zero, total_x - halo);
+        (gy, gx, oob_under || gy >= h || gx >= w)
+    }
+
+    #[cube]
+    fn gw<F: Float>(#[comptime] i: u32) -> F {
+        F::new(comptime![gauss_taps()[i as usize]])
+    }
+
+    /// Forward: produce the L1 + SSIM loss map. When dispatched with `C = 4`,
+    /// the workgroup at `c == 3` produces `|pred.a - gt.a|` into the alpha
+    /// channel of the loss map — folding the previously-separate alpha-match
+    /// kernel into the same launch.
+    ///
+    /// Comptime flags:
+    /// - `composite`: apply `gt + (1 - gt.a) * bg` to the gt sample. Set when
+    ///   the source has real alpha and `bg != 0`; opaque/synthesised alpha or
+    ///   zero bg make the math a no-op so callers gate it off to skip the work.
+    /// - `mask`: multiply the loss-map output by `gt.a` per pixel.
+    #[allow(clippy::assign_op_pattern, clippy::fn_params_excessive_bools)]
+    #[cube(launch)]
+    pub fn image_loss_forward_kernel<F: Float>(
+        pred: &Tensor<F>,
+        gt_packed: &Tensor<u32>,
+        loss_map: &mut Tensor<F>,
+        partials: &mut Tensor<F>,
+        h: u32,
+        w: u32,
+        cn: u32,
+        l1_weight: f32,
+        ssim_weight: f32,
+        rgb_weight: f32,
+        alpha_weight: f32,
+        bg_r: f32,
+        bg_g: f32,
+        bg_b: f32,
+        #[comptime] composite: bool,
+        #[comptime] mask: bool,
+        #[comptime] reduce: bool,
+    ) {
+        let c = CUBE_POS_Z;
+        let tile_y0 = CUBE_POS_Y * BLOCK_Y;
+        let tile_x0 = CUBE_POS_X * BLOCK_X;
+        let pix_y = tile_y0 + UNIT_POS_Y;
+        let pix_x = tile_x0 + UNIT_POS_X;
+        let in_bounds = pix_x < w && pix_y < h;
+        let tile_id = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
+
+        // Alpha-match channel, only launched when matching: per-pixel
+        // `|pred - gt.a|`, no blur.
+        if c == 3u32 {
+            let mut v = F::cast_from(0.0_f32);
+            if in_bounds {
+                let idx = ((pix_y * w + pix_x) * cn + 3u32) as usize;
+                let (_, gt_a) = read_gt::<F>(gt_packed, 0u32, pix_y, pix_x, false, w);
+                v = F::abs(pred[idx] - gt_a);
+                if mask {
+                    v = v * gt_a;
+                }
+            }
+            if reduce {
+                let total = tile_sum::<F>(v);
+                if UNIT_POS == 0u32 {
+                    partials[(3u32 * num_tiles(h, w) + tile_id) as usize] =
+                        total * F::cast_from(alpha_weight);
+                }
+            } else if in_bounds {
+                loss_map[((pix_y * w + pix_x) * cn + 3u32) as usize] = v;
+            }
+            terminate!();
+        }
+
+        // Tile + halo of (pred, gt_eff_c) interleaved as 2 floats. cubecl's
+        // WGSL backend over-counts shared memory by 2x (it reports double the
+        // bytes actually declared in WGSL), so this kernel has to stay under
+        // ~half the real Apple Metal threadgroup budget. gt_a was previously
+        // carried here too; the mask=true path now re-reads it at the centre.
+        let mut s_tile = Shared::new_slice((SHARED_Y * SHARED_X * 2) as usize);
+        let mut x_conv = Shared::new_slice((SHARED_Y * BLOCK_X * 5) as usize);
+
+        let bg_c = if composite {
+            if c == 0u32 {
+                F::cast_from(bg_r)
+            } else if c == 1u32 {
+                F::cast_from(bg_g)
+            } else {
+                F::cast_from(bg_b)
+            }
+        } else {
+            F::cast_from(0.0_f32)
+        };
+
+        let thread_rank = UNIT_POS_Y * BLOCK_X + UNIT_POS_X;
+        let threads = BLOCK_X * BLOCK_Y;
+        let tile_size = SHARED_Y * SHARED_X;
+        #[unroll]
+        for s in 0u32..3u32 {
+            let tid = s * threads + thread_rank;
+            if tid < tile_size {
+                let local_y = tid / SHARED_X;
+                let local_x = tid % SHARED_X;
+                let (gy, gx, oob) = coords(tile_y0, tile_x0, local_y, local_x, HALO, h, w);
+                let pv = read_pred::<F>(pred, c, gy, gx, oob, cn, w);
+                let (gt_c, gt_a) = read_gt::<F>(gt_packed, c, gy, gx, oob, w);
+                let gt_eff = if composite {
+                    gt_c + (F::cast_from(1.0_f32) - gt_a) * bg_c
+                } else {
+                    gt_c
+                };
+                let base = ((local_y * SHARED_X + local_x) * 2u32) as usize;
+                s_tile[base] = pv;
+                s_tile[base + 1] = gt_eff;
+            }
+        }
+        sync_cube();
+
+        // Horizontal 11-tap blur over (pred, gt_eff_c) -> 5 sums per pixel.
+        let lx = UNIT_POS_X + HALO;
+        #[unroll]
+        for pass in 0u32..2u32 {
+            let ly = UNIT_POS_Y + pass * BLOCK_Y;
+            if ly < SHARED_Y {
+                let mut sum_x = F::cast_from(0.0_f32);
+                let mut sum_x2 = F::cast_from(0.0_f32);
+                let mut sum_y = F::cast_from(0.0_f32);
+                let mut sum_y2 = F::cast_from(0.0_f32);
+                let mut sum_xy = F::cast_from(0.0_f32);
+                #[unroll]
+                for d in 1u32..6u32 {
+                    let w_d = gw::<F>(comptime![5u32 - d]);
+                    let il = (ly * SHARED_X + (lx - d)) as usize;
+                    let ir = (ly * SHARED_X + (lx + d)) as usize;
+                    let xl = s_tile[il * 2];
+                    let yl = s_tile[il * 2 + 1];
+                    let xr = s_tile[ir * 2];
+                    let yr = s_tile[ir * 2 + 1];
+                    sum_x += (xl + xr) * w_d;
+                    sum_x2 += (xl * xl + xr * xr) * w_d;
+                    sum_y += (yl + yr) * w_d;
+                    sum_y2 += (yl * yl + yr * yr) * w_d;
+                    sum_xy += (xl * yl + xr * yr) * w_d;
+                }
+                let ic = (ly * SHARED_X + lx) as usize;
+                let xc = s_tile[ic * 2];
+                let yc = s_tile[ic * 2 + 1];
+                let wc = gw::<F>(5u32);
+                sum_x += xc * wc;
+                sum_x2 += xc * xc * wc;
+                sum_y += yc * wc;
+                sum_y2 += yc * yc * wc;
+                sum_xy += xc * yc * wc;
+                let base = ((ly * BLOCK_X + UNIT_POS_X) * 5) as usize;
+                x_conv[base] = sum_x;
+                x_conv[base + 1] = sum_x2;
+                x_conv[base + 2] = sum_y;
+                x_conv[base + 3] = sum_y2;
+                x_conv[base + 4] = sum_xy;
+            }
+        }
+        sync_cube();
+
+        // Vertical 11-tap blur, then derive SSIM and emit L1 + SSIM loss.
+        let ly = UNIT_POS_Y + HALO;
+        let lx = UNIT_POS_X;
+        let mut out0 = F::cast_from(0.0_f32);
+        let mut out1 = F::cast_from(0.0_f32);
+        let mut out2 = F::cast_from(0.0_f32);
+        let mut out3 = F::cast_from(0.0_f32);
+        let mut out4 = F::cast_from(0.0_f32);
+        #[unroll]
+        for d in 1u32..6u32 {
+            let w_d = gw::<F>(comptime![5u32 - d]);
+            let bt = (((ly - d) * BLOCK_X + lx) * 5) as usize;
+            let bb = (((ly + d) * BLOCK_X + lx) * 5) as usize;
+            out0 += (x_conv[bt] + x_conv[bb]) * w_d;
+            out1 += (x_conv[bt + 1] + x_conv[bb + 1]) * w_d;
+            out2 += (x_conv[bt + 2] + x_conv[bb + 2]) * w_d;
+            out3 += (x_conv[bt + 3] + x_conv[bb + 3]) * w_d;
+            out4 += (x_conv[bt + 4] + x_conv[bb + 4]) * w_d;
+        }
+        let bc = ((ly * BLOCK_X + lx) * 5) as usize;
+        let wc = gw::<F>(5u32);
+        out0 += x_conv[bc] * wc;
+        out1 += x_conv[bc + 1] * wc;
+        out2 += x_conv[bc + 2] * wc;
+        out3 += x_conv[bc + 3] * wc;
+        out4 += x_conv[bc + 4] * wc;
+
+        let mut loss_out = F::cast_from(0.0_f32);
+        if in_bounds {
+            let zero = F::cast_from(0.0_f32);
+            let two = F::cast_from(2.0_f32);
+            let mu1 = out0;
+            let mu2 = out2;
+            let mu1_sq = mu1 * mu1;
+            let mu2_sq = mu2 * mu2;
+            let sigma1_sq = F::max(zero, out1 - mu1_sq);
+            let sigma2_sq = F::max(zero, out3 - mu2_sq);
+            let sigma12 = out4 - mu1 * mu2;
+            let a = mu1_sq + mu2_sq + F::new(C1);
+            let b = sigma1_sq + sigma2_sq + F::new(C2);
+            let c_top = two * mu1 * mu2 + F::new(C1);
+            let d_top = two * sigma12 + F::new(C2);
+            let raw = (c_top * d_top) / (a * b);
+            let val = clamp(raw, F::cast_from(-1.0_f32), F::cast_from(1.0_f32));
+
+            let centre = ((UNIT_POS_Y + HALO) * SHARED_X + (UNIT_POS_X + HALO)) as usize;
+            let p1 = s_tile[centre * 2];
+            let p2 = s_tile[centre * 2 + 1];
+            let l1 = F::abs(p1 - p2);
+            let mut loss_v = F::cast_from(l1_weight) * l1 + F::cast_from(ssim_weight) * val;
+            if mask {
+                let (_, gt_a) = read_gt::<F>(gt_packed, c, pix_y, pix_x, false, w);
+                loss_v = loss_v * gt_a;
+            }
+            loss_out = loss_v;
+        }
+        if reduce {
+            // Weighted per-tile sum; the host adds up the tiles. Keeps the
+            // per-pixel map off memory entirely.
+            let total = tile_sum::<F>(loss_out);
+            if UNIT_POS == 0u32 {
+                partials[(c * num_tiles(h, w) + tile_id) as usize] =
+                    total * F::cast_from(rgb_weight);
+            }
+        } else if in_bounds {
+            loss_map[((pix_y * w + pix_x) * cn + c) as usize] = loss_out;
+        }
+    }
+
+    /// Backward: recompute SSIM partials inline, scatter `dL/dpred` per pixel.
+    ///
+    /// Each `sync_cube` boundary frees a scratch role, so the four logical
+    /// arrays alias into two physical buffers. Tile is 8x8 (rather than 16x16
+    /// like the forward) because cubecl-wgpu's shared-memory limit check
+    /// reports double the bytes actually declared in WGSL, and the 16x16
+    /// layout's ~28 KiB would trip Apple's 32 KiB threadgroup limit under
+    /// that doubled accounting.
+    #[allow(clippy::assign_op_pattern, clippy::fn_params_excessive_bools)]
+    #[cube(launch)]
+    pub fn image_loss_backward_kernel<F: Float>(
+        pred: &Tensor<F>,
+        gt_packed: &Tensor<u32>,
+        dl_dpartials: &Tensor<F>,
+        dl_dpred: &mut Tensor<F>,
+        h: u32,
+        w: u32,
+        cn: u32,
+        l1_weight: f32,
+        ssim_weight: f32,
+        rgb_weight: f32,
+        alpha_weight: f32,
+        bg_r: f32,
+        bg_g: f32,
+        bg_b: f32,
+        #[comptime] composite: bool,
+        #[comptime] mask: bool,
+        #[comptime] alpha_match: bool,
+    ) {
+        let c = CUBE_POS_Z;
+        let tile_y0 = CUBE_POS_Y * BLOCK_Y_BWD;
+        let tile_x0 = CUBE_POS_X * BLOCK_X_BWD;
+        let pix_y = tile_y0 + UNIT_POS_Y;
+        let pix_x = tile_x0 + UNIT_POS_X;
+
+        // Alpha channel: sign-of-diff when matching alpha, else a zero
+        // gradient (the output is uninitialised, so it must be written).
+        if c == 3u32 {
+            if pix_x < w && pix_y < h {
+                let idx = ((pix_y * w + pix_x) * cn + 3u32) as usize;
+                let mut g = F::cast_from(0.0_f32);
+                if alpha_match {
+                    let (_, gt_a) = read_gt::<F>(gt_packed, 0u32, pix_y, pix_x, false, w);
+                    let diff = pred[idx] - gt_a;
+                    let zero = F::cast_from(0.0_f32);
+                    let sign = if diff > zero {
+                        F::cast_from(1.0_f32)
+                    } else if diff < zero {
+                        F::cast_from(-1.0_f32)
+                    } else {
+                        zero
+                    };
+                    let mut chain = chain_at::<F>(
+                        dl_dpartials,
+                        3u32,
+                        pix_y,
+                        pix_x,
+                        h,
+                        w,
+                        F::cast_from(alpha_weight),
+                    );
+                    if mask {
+                        chain = chain * gt_a;
+                    }
+                    g = sign * chain;
+                }
+                dl_dpred[idx] = g;
+            }
+            terminate!();
+        }
+
+        // buf_a holds the image tile, then chain*partials after the v-blur.
+        // buf_b holds the 1st h-blur sums, then the 2nd h-blur sums.
+        let mut buf_a = Shared::new_slice((EXT_Y_BWD * EXT_X_BWD * 2) as usize);
+        let mut buf_b = Shared::new_slice((EXT_Y_BWD * SHARED_X_BWD * 5) as usize);
+
+        let bg_c = if composite {
+            if c == 0u32 {
+                F::cast_from(bg_r)
+            } else if c == 1u32 {
+                F::cast_from(bg_g)
+            } else {
+                F::cast_from(bg_b)
+            }
+        } else {
+            F::cast_from(0.0_f32)
+        };
+
+        let thread_rank = UNIT_POS_Y * BLOCK_X_BWD + UNIT_POS_X;
+
+        // Load pred and effective-gt with halo of 2*HALO into buf_a.
+        let ext_size = EXT_Y_BWD * EXT_X_BWD;
+        #[unroll]
+        for s in 0u32..LOAD_ITERS_BWD {
+            let tid = s * THREADS_BWD + thread_rank;
+            if tid < ext_size {
+                let local_y = tid / EXT_X_BWD;
+                let local_x = tid % EXT_X_BWD;
+                let (gy, gx, oob) = coords(tile_y0, tile_x0, local_y, local_x, 2u32 * HALO, h, w);
+                let pv = read_pred::<F>(pred, c, gy, gx, oob, cn, w);
+                let (gt_c, gt_a) = read_gt::<F>(gt_packed, c, gy, gx, oob, w);
+                let gt_eff = if composite {
+                    gt_c + (F::cast_from(1.0_f32) - gt_a) * bg_c
+                } else {
+                    gt_c
+                };
+                let base = ((local_y * EXT_X_BWD + local_x) * 2u32) as usize;
+                buf_a[base] = pv;
+                buf_a[base + 1] = gt_eff;
+            }
+        }
+        sync_cube();
+
+        // Horizontal blur over the extended tile.
+        let horiz_size = EXT_Y_BWD * SHARED_X_BWD;
+        #[unroll]
+        for s in 0u32..HBLUR_ITERS_BWD {
+            let tid = s * THREADS_BWD + thread_rank;
+            if tid < horiz_size {
+                let row_y = tid / SHARED_X_BWD;
+                let col_x = tid % SHARED_X_BWD;
+                let center = col_x + HALO;
+                let mut sum_x = F::cast_from(0.0_f32);
+                let mut sum_x2 = F::cast_from(0.0_f32);
+                let mut sum_y = F::cast_from(0.0_f32);
+                let mut sum_y2 = F::cast_from(0.0_f32);
+                let mut sum_xy = F::cast_from(0.0_f32);
+                #[unroll]
+                for d in 1u32..6u32 {
+                    let w_d = gw::<F>(comptime![5u32 - d]);
+                    let il = ((row_y * EXT_X_BWD + (center - d)) * 2u32) as usize;
+                    let ir = ((row_y * EXT_X_BWD + (center + d)) * 2u32) as usize;
+                    let xl = buf_a[il];
+                    let yl = buf_a[il + 1];
+                    let xr = buf_a[ir];
+                    let yr = buf_a[ir + 1];
+                    sum_x += (xl + xr) * w_d;
+                    sum_x2 += (xl * xl + xr * xr) * w_d;
+                    sum_y += (yl + yr) * w_d;
+                    sum_y2 += (yl * yl + yr * yr) * w_d;
+                    sum_xy += (xl * yl + xr * yr) * w_d;
+                }
+                let ic = ((row_y * EXT_X_BWD + center) * 2u32) as usize;
+                let xc = buf_a[ic];
+                let yc = buf_a[ic + 1];
+                let wc = gw::<F>(5u32);
+                sum_x += xc * wc;
+                sum_x2 += xc * xc * wc;
+                sum_y += yc * wc;
+                sum_y2 += yc * yc * wc;
+                sum_xy += xc * yc * wc;
+                let base = ((row_y * SHARED_X_BWD + col_x) * 5u32) as usize;
+                buf_b[base] = sum_x;
+                buf_b[base + 1] = sum_x2;
+                buf_b[base + 2] = sum_y;
+                buf_b[base + 3] = sum_y2;
+                buf_b[base + 4] = sum_xy;
+            }
+        }
+        sync_cube();
+
+        // Vertical blur, derive SSIM partials, multiply by chain * (mask if any).
+        // Reuses buf_a (image tile is dead) for chain*partials.
+        let partial_size = SHARED_Y_BWD * SHARED_X_BWD;
+        #[unroll]
+        for s in 0u32..PARTIAL_ITERS_BWD {
+            let tid = s * THREADS_BWD + thread_rank;
+            if tid < partial_size {
+                let part_y = tid / SHARED_X_BWD;
+                let part_x = tid % SHARED_X_BWD;
+                let center = part_y + HALO;
+
+                let mut out0 = F::cast_from(0.0_f32);
+                let mut out1 = F::cast_from(0.0_f32);
+                let mut out2 = F::cast_from(0.0_f32);
+                let mut out3 = F::cast_from(0.0_f32);
+                let mut out4 = F::cast_from(0.0_f32);
+                #[unroll]
+                for d in 1u32..6u32 {
+                    let w_d = gw::<F>(comptime![5u32 - d]);
+                    let bt = (((center - d) * SHARED_X_BWD + part_x) * 5u32) as usize;
+                    let bb = (((center + d) * SHARED_X_BWD + part_x) * 5u32) as usize;
+                    out0 += (buf_b[bt] + buf_b[bb]) * w_d;
+                    out1 += (buf_b[bt + 1] + buf_b[bb + 1]) * w_d;
+                    out2 += (buf_b[bt + 2] + buf_b[bb + 2]) * w_d;
+                    out3 += (buf_b[bt + 3] + buf_b[bb + 3]) * w_d;
+                    out4 += (buf_b[bt + 4] + buf_b[bb + 4]) * w_d;
+                }
+                let bc = ((center * SHARED_X_BWD + part_x) * 5u32) as usize;
+                let wc = gw::<F>(5u32);
+                out0 += buf_b[bc] * wc;
+                out1 += buf_b[bc + 1] * wc;
+                out2 += buf_b[bc + 2] * wc;
+                out3 += buf_b[bc + 3] * wc;
+                out4 += buf_b[bc + 4] * wc;
+
+                let zero = F::cast_from(0.0_f32);
+                let two = F::cast_from(2.0_f32);
+                let mu1 = out0;
+                let mu2 = out2;
+                let mu1_sq = mu1 * mu1;
+                let mu2_sq = mu2 * mu2;
+                let sigma1_sq = F::max(zero, out1 - mu1_sq);
+                let sigma2_sq = F::max(zero, out3 - mu2_sq);
+                let sigma12 = out4 - mu1 * mu2;
+                let a = mu1_sq + mu2_sq + F::new(C1);
+                let b = sigma1_sq + sigma2_sq + F::new(C2);
+                let c_top = two * mu1 * mu2 + F::new(C1);
+                let d_top = two * sigma12 + F::new(C2);
+                let inv_ab = F::cast_from(1.0_f32) / (a * b);
+                let cd = c_top * d_top * inv_ab;
+                let raw = cd;
+                let clamped = raw < F::cast_from(-1.0_f32) || raw > F::cast_from(1.0_f32);
+
+                let dmu1 = if clamped {
+                    zero
+                } else {
+                    two * mu2 * inv_ab * (d_top - c_top)
+                        - two * mu1 * cd * (F::cast_from(1.0_f32) / a - F::cast_from(1.0_f32) / b)
+                };
+                let dsigma1 = if clamped { zero } else { -cd / b };
+                let dsigma12 = if clamped { zero } else { two * c_top * inv_ab };
+
+                let (gy, gx, oob) = coords(tile_y0, tile_x0, part_y, part_x, HALO, h, w);
+                let mut chain = select(
+                    oob,
+                    F::cast_from(0.0_f32),
+                    chain_at::<F>(dl_dpartials, c, gy, gx, h, w, F::cast_from(rgb_weight)),
+                );
+                if mask {
+                    let (_unused, gt_a) = read_gt::<F>(gt_packed, c, gy, gx, oob, w);
+                    chain = chain * gt_a;
+                }
+
+                let base = ((part_y * SHARED_X_BWD + part_x) * 3u32) as usize;
+                buf_a[base] = dmu1 * chain;
+                buf_a[base + 1] = dsigma1 * chain;
+                buf_a[base + 2] = dsigma12 * chain;
+            }
+        }
+        sync_cube();
+
+        // Second horizontal blur over chain * partials.
+        // Reuses buf_b (1st-blur sums are dead) for the inner-blur output.
+        let lx_b = UNIT_POS_X + HALO;
+        #[unroll]
+        for pass in 0u32..INNER_H_PASSES_BWD {
+            let ly_b = UNIT_POS_Y + pass * BLOCK_Y_BWD;
+            if ly_b < SHARED_Y_BWD {
+                let mut a0 = F::cast_from(0.0_f32);
+                let mut a1 = F::cast_from(0.0_f32);
+                let mut a2 = F::cast_from(0.0_f32);
+                #[unroll]
+                for d in 1u32..6u32 {
+                    let w_d = gw::<F>(comptime![5u32 - d]);
+                    let il = ((ly_b * SHARED_X_BWD + (lx_b - d)) * 3u32) as usize;
+                    let ir = ((ly_b * SHARED_X_BWD + (lx_b + d)) * 3u32) as usize;
+                    a0 += (buf_a[il] + buf_a[ir]) * w_d;
+                    a1 += (buf_a[il + 1] + buf_a[ir + 1]) * w_d;
+                    a2 += (buf_a[il + 2] + buf_a[ir + 2]) * w_d;
+                }
+                let ic = ((ly_b * SHARED_X_BWD + lx_b) * 3u32) as usize;
+                let wc = gw::<F>(5u32);
+                a0 += buf_a[ic] * wc;
+                a1 += buf_a[ic + 1] * wc;
+                a2 += buf_a[ic + 2] * wc;
+                let base = ((ly_b * BLOCK_X_BWD + UNIT_POS_X) * 3u32) as usize;
+                buf_b[base] = a0;
+                buf_b[base + 1] = a1;
+                buf_b[base + 2] = a2;
+            }
+        }
+        sync_cube();
+
+        // Second vertical blur + L1 sign + write.
+        if pix_x < w && pix_y < h {
+            let ly = UNIT_POS_Y + HALO;
+            let lx = UNIT_POS_X;
+            let mut s0 = F::cast_from(0.0_f32);
+            let mut s1 = F::cast_from(0.0_f32);
+            let mut s2 = F::cast_from(0.0_f32);
+            #[unroll]
+            for d in 1u32..6u32 {
+                let w_d = gw::<F>(comptime![5u32 - d]);
+                let bt = (((ly - d) * BLOCK_X_BWD + lx) * 3u32) as usize;
+                let bb = (((ly + d) * BLOCK_X_BWD + lx) * 3u32) as usize;
+                s0 += (buf_b[bt] + buf_b[bb]) * w_d;
+                s1 += (buf_b[bt + 1] + buf_b[bb + 1]) * w_d;
+                s2 += (buf_b[bt + 2] + buf_b[bb + 2]) * w_d;
+            }
+            let bc = ((ly * BLOCK_X_BWD + lx) * 3u32) as usize;
+            let wc = gw::<F>(5u32);
+            s0 += buf_b[bc] * wc;
+            s1 += buf_b[bc + 1] * wc;
+            s2 += buf_b[bc + 2] * wc;
+
+            let pix_idx = ((pix_y * w + pix_x) * cn + c) as usize;
+            let p1 = pred[pix_idx];
+            let (gt_c, gt_a) = read_gt::<F>(gt_packed, c, pix_y, pix_x, false, w);
+            let gt_eff = if composite {
+                gt_c + (F::cast_from(1.0_f32) - gt_a) * bg_c
+            } else {
+                gt_c
+            };
+            let ssim_grad = s0 + (F::cast_from(2.0_f32) * p1) * s1 + gt_eff * s2;
+            let diff = p1 - gt_eff;
+            let zero = F::cast_from(0.0_f32);
+            let l1_sign = if diff > zero {
+                F::cast_from(1.0_f32)
+            } else if diff < zero {
+                F::cast_from(-1.0_f32)
+            } else {
+                zero
+            };
+            let mut chain_centre = chain_at::<F>(
+                dl_dpartials,
+                c,
+                pix_y,
+                pix_x,
+                h,
+                w,
+                F::cast_from(rgb_weight),
+            );
+            if mask {
+                chain_centre = chain_centre * gt_a;
+            }
+            dl_dpred[pix_idx] = F::cast_from(ssim_weight) * ssim_grad
+                + F::cast_from(l1_weight) * l1_sign * chain_centre;
+        }
+    }
+
+    /// Decode `gt_packed` to `[H, W, 3]` f32 RGB. Comptime `composite` gates
+    /// the `gt + (1 - gt.a) * bg` math; callers pass false when the source
+    /// has no real alpha or when `bg == 0`. Used by the LPIPS path.
+    #[cube(launch)]
+    pub fn unpack_gt_rgb_kernel<F: Float>(
+        gt_packed: &Tensor<u32>,
+        out: &mut Tensor<F>,
+        h: u32,
+        w: u32,
+        bg_r: f32,
+        bg_g: f32,
+        bg_b: f32,
+        #[comptime] composite: bool,
+    ) {
+        let pix_y = CUBE_POS_Y * BLOCK_Y + UNIT_POS_Y;
+        let pix_x = CUBE_POS_X * BLOCK_X + UNIT_POS_X;
+        if pix_x >= w || pix_y >= h {
+            terminate!();
+        }
+        let val = gt_packed[(pix_y * w + pix_x) as usize];
+        let mut r = f32::cast_from(val & 0xffu32) * INV_255;
+        let mut g = f32::cast_from((val >> 8u32) & 0xffu32) * INV_255;
+        let mut b = f32::cast_from((val >> 16u32) & 0xffu32) * INV_255;
+        if composite {
+            let inv_a = 1.0_f32 - f32::cast_from(val >> 24u32) * INV_255;
+            r += inv_a * bg_r;
+            g += inv_a * bg_g;
+            b += inv_a * bg_b;
+        }
+        let base = ((pix_y * w + pix_x) * 3u32) as usize;
+        out[base] = F::cast_from(r);
+        out[base + 1] = F::cast_from(g);
+        out[base + 2] = F::cast_from(b);
+    }
+}
+
+/// Image-loss configuration.
+///
+/// `composite_bg = Some(bg)` folds `gt + (1 - gt.a) * bg` into the kernel
+/// before comparing against `pred`. `None` skips the math entirely — set it
+/// when GT has no real alpha (synthesised `a = 1` makes the term zero) or
+/// when `bg == 0`, since the kernel pays for the always-on math otherwise.
+#[derive(Debug, Clone, Copy)]
+pub struct ImageLossConfig {
+    pub l1_weight: f32,
+    pub ssim_weight: f32,
+    pub composite_bg: Option<Vec3>,
+    /// If true, multiply each loss-map pixel by `gt.a`.
+    pub mask: bool,
+    /// Weight of the alpha-match term, `mean |pred.a - gt.a|`, added to the
+    /// RGB mean when `pred` has 4 channels. Zero disables it: the alpha
+    /// channel is then ignored and gets a zero gradient. The eval map's alpha
+    /// channel holds the unweighted per-pixel term.
+    pub alpha_weight: f32,
+}
+
+/// Side of the square tiles the loss kernel reduces; partial sums come back
+/// one per tile.
+pub const TILE_SIZE: usize = kernels::BLOCK_X as usize;
+
+/// Number of tiles the loss kernel splits an `h × w` image into.
+fn loss_tiles(h: usize, w: usize) -> usize {
+    w.div_ceil(TILE_SIZE) * h.div_ceil(TILE_SIZE)
+}
+
+/// Whether the alpha-match term runs: it needs a weight and a 4-channel pred.
+fn alpha_match(cfg: &ImageLossConfig, cn: u32) -> bool {
+    cfg.alpha_weight > 0.0 && cn == 4
+}
+
+/// Channel planes the kernels launch: rgb, plus alpha when matching.
+fn planes(cfg: &ImageLossConfig, cn: u32) -> u32 {
+    if alpha_match(cfg, cn) { 4 } else { 3 }
+}
+
+/// Weights that turn the per-tile channel sums into the loss: rgb averaged
+/// over `3·H·W`, alpha over `H·W` times its weight.
+fn channel_weights(cfg: &ImageLossConfig, h: u32, w: u32) -> (f32, f32) {
+    let pixels = (h * w) as f32;
+    (1.0 / (3.0 * pixels), cfg.alpha_weight / pixels)
+}
+
+/// Backend hooks for the loss kernels. `pred` is `[H, W, C]` with 3 or 4
+/// channels, the rasterizer's native layout. When alpha matching, the
+/// `c == 3` workgroup runs the alpha-match path (`|pred.a - gt.a|`) instead
+/// of SSIM + L1, folded into the same launch.
+#[burn::backend::backend_extension(Cube, Autodiff, Fusion)]
+pub trait LossOps: Backend {
+    /// Forward loss. `reduce` picks the output: `false` writes the per-pixel
+    /// map `[H, W, C]` (eval only), `true` the weighted per-tile partial sums
+    /// `[planes, tiles]` (rows r, g, b, and alpha when matching) that add up
+    /// to the loss, so the per-pixel map never touches memory. Only the
+    /// reduced form carries a gradient.
+    #[fusion(dtype = pred, shape = {
+        if *reduce {
+            Shape::new([
+                planes(cfg, pred[2] as u32) as usize,
+                loss_tiles(pred[0], pred[1]),
+            ])
+        } else {
+            pred.clone()
+        }
+    })]
+    fn image_loss_forward(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        cfg: ImageLossConfig,
+        reduce: bool,
+    ) -> FloatTensor<Self>;
+
+    /// Gradient of the loss w.r.t. `pred` given the gradient w.r.t. the
+    /// partial sums `[planes, tiles]`.
+    #[fusion(dtype = pred, shape = pred)]
+    fn image_loss_backward(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        dl_dpartials: FloatTensor<Self>,
+        cfg: ImageLossConfig,
+    ) -> FloatTensor<Self>;
+
+    #[fusion(dtype = DType::F32, shape = Shape::new([gt_packed[0], gt_packed[1], 3]))]
+    fn unpack_gt_rgb(gt_packed: IntTensor<Self>, composite_bg: Option<Vec3>) -> FloatTensor<Self>;
+}
+
+/// `[H, W, C]` dims of a pred tensor, checked against `gt_packed`.
+fn image_dims(pred: &CubeTensor, gt_packed: &CubeTensor) -> (u32, u32, u32) {
+    let dims = pred.shape().as_slice().to_vec();
+    assert_eq!(dims.len(), 3, "image loss expects [H, W, C] pred");
+    let (h, w, c) = (dims[0] as u32, dims[1] as u32, dims[2] as u32);
+    assert!(
+        c == 3 || c == 4,
+        "image loss expects 3 or 4 channels, got {c}"
+    );
+    let gt_dims = gt_packed.shape().as_slice().to_vec();
+    assert_eq!(gt_dims.len(), 2, "image loss expects [H, W] gt_packed");
+    assert_eq!(gt_dims[0] as u32, h, "gt_packed height must match pred");
+    assert_eq!(gt_dims[1] as u32, w, "gt_packed width must match pred");
+    (h, w, c)
+}
+
+fn cube_count_3d(c: u32, h: u32, w: u32) -> burn::cubecl::prelude::CubeCount {
+    use burn::cubecl::prelude::CubeCount;
+    CubeCount::Static(
+        w.div_ceil(kernels::BLOCK_X),
+        h.div_ceil(kernels::BLOCK_Y),
+        c,
+    )
+}
+
+fn cube_count_3d_bwd(c: u32, h: u32, w: u32) -> burn::cubecl::prelude::CubeCount {
+    use burn::cubecl::prelude::CubeCount;
+    CubeCount::Static(
+        w.div_ceil(kernels::BLOCK_X_BWD),
+        h.div_ceil(kernels::BLOCK_Y_BWD),
+        c,
+    )
+}
+
+/// Runs the forward kernel. `reduce = false` writes the `[H, W, C]` loss map
+/// (alpha channel only when matching); `reduce = true` writes weighted
+/// per-tile partial sums `[planes, tiles]` instead and leaves the map
+/// untouched.
+fn launch_image_forward(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
+    cfg: ImageLossConfig,
+    reduce: bool,
+) -> CubeTensor {
+    use burn::cubecl::prelude::CubeDim;
+
+    let pred = into_contiguous(pred);
+    let gt_packed = into_contiguous(gt_packed);
+    let (h, w, cn) = image_dims(&pred, &gt_packed);
+    let planes = planes(&cfg, cn);
+    let (rgb_weight, alpha_weight) = channel_weights(&cfg, h, w);
+
+    let composite = cfg.composite_bg.is_some();
+    let bg = cfg.composite_bg.unwrap_or(Vec3::ZERO);
+    let client = pred.client.clone();
+    let device = pred.device.clone();
+    // The kernel only touches the output its mode selects; the other is a
+    // placeholder. Every partial is written by its own cube, so no fill.
+    let (map, partials) = if reduce {
+        let tiles = loss_tiles(h as usize, w as usize);
+        (
+            create_tensor([1], &device, DType::F32),
+            create_tensor([planes as usize, tiles], &device, DType::F32),
+        )
+    } else {
+        (
+            burn_cubecl::ops::numeric::zeros_client(
+                client.clone(),
+                device.clone(),
+                Shape::new([h as usize, w as usize, cn as usize]),
+                DType::F32,
+            ),
+            create_tensor([1], &device, DType::F32),
+        )
+    };
+    kernels::image_loss_forward_kernel::launch::<f32>(
+        &client,
+        cube_count_3d(planes, h, w),
+        CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
+        pred.into_tensor_arg(),
+        gt_packed.into_tensor_arg(),
+        map.clone().into_tensor_arg(),
+        partials.clone().into_tensor_arg(),
+        h,
+        w,
+        cn,
+        cfg.l1_weight,
+        cfg.ssim_weight,
+        rgb_weight,
+        alpha_weight,
+        bg.x,
+        bg.y,
+        bg.z,
+        composite,
+        cfg.mask,
+        reduce,
+    );
+    if reduce { partials } else { map }
+}
+
+fn launch_image_backward(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
+    dl_dpartials: CubeTensor,
+    cfg: ImageLossConfig,
+) -> CubeTensor {
+    use burn::cubecl::prelude::CubeDim;
+
+    let pred = into_contiguous(pred);
+    let gt_packed = into_contiguous(gt_packed);
+    let dl_dpartials = into_contiguous(dl_dpartials);
+    let (h, w, cn) = image_dims(&pred, &gt_packed);
+    let alpha_match = alpha_match(&cfg, cn);
+    let (rgb_weight, alpha_weight) = channel_weights(&cfg, h, w);
+    assert_eq!(
+        dl_dpartials.shape().as_slice(),
+        &[
+            planes(&cfg, cn) as usize,
+            loss_tiles(h as usize, w as usize)
+        ],
+        "dl_dpartials must be [planes, tiles]"
+    );
+
+    let composite = cfg.composite_bg.is_some();
+    let bg = cfg.composite_bg.unwrap_or(Vec3::ZERO);
+    // Every pixel of every channel is written (the alpha channel with zeros
+    // when not matching), so the output needs no fill.
+    let dl_dpred = create_tensor(
+        [h as usize, w as usize, cn as usize],
+        &pred.device,
+        DType::F32,
+    );
+    let client = pred.client.clone();
+
+    kernels::image_loss_backward_kernel::launch::<f32>(
+        &client,
+        cube_count_3d_bwd(cn, h, w),
+        CubeDim::new_2d(kernels::BLOCK_X_BWD, kernels::BLOCK_Y_BWD),
+        pred.into_tensor_arg(),
+        gt_packed.into_tensor_arg(),
+        dl_dpartials.into_tensor_arg(),
+        dl_dpred.clone().into_tensor_arg(),
+        h,
+        w,
+        cn,
+        cfg.l1_weight,
+        cfg.ssim_weight,
+        rgb_weight,
+        alpha_weight,
+        bg.x,
+        bg.y,
+        bg.z,
+        composite,
+        cfg.mask,
+        alpha_match,
+    );
+    dl_dpred
+}
+
+fn launch_unpack_gt_rgb(gt_packed: CubeTensor, composite_bg: Option<Vec3>) -> CubeTensor {
+    use burn::cubecl::prelude::{CubeCount, CubeDim};
+
+    let gt_packed = into_contiguous(gt_packed);
+    let dims = gt_packed.shape().as_slice().to_vec();
+    assert_eq!(dims.len(), 2, "unpack_gt_rgb expects [H, W] gt_packed");
+    let (h, w) = (dims[0] as u32, dims[1] as u32);
+    let composite = composite_bg.is_some();
+    let bg = composite_bg.unwrap_or(Vec3::ZERO);
+
+    let client = gt_packed.client.clone();
+    let out = burn_cubecl::ops::numeric::zeros_client(
+        client.clone(),
+        gt_packed.device.clone(),
+        Shape::new([h as usize, w as usize, 3]),
+        DType::F32,
+    );
+    let cube_count = CubeCount::Static(
+        w.div_ceil(kernels::BLOCK_X),
+        h.div_ceil(kernels::BLOCK_Y),
+        1,
+    );
+    kernels::unpack_gt_rgb_kernel::launch::<f32>(
+        &client,
+        cube_count,
+        CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
+        gt_packed.into_tensor_arg(),
+        out.clone().into_tensor_arg(),
+        h,
+        w,
+        bg.x,
+        bg.y,
+        bg.z,
+        composite,
+    );
+    out
+}
+
+impl LossOps for CubeBackend {
+    fn image_loss_forward(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        cfg: ImageLossConfig,
+        reduce: bool,
+    ) -> FloatTensor<Self> {
+        launch_image_forward(pred, gt_packed, cfg, reduce)
+    }
+
+    fn image_loss_backward(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        dl_dpartials: FloatTensor<Self>,
+        cfg: ImageLossConfig,
+    ) -> FloatTensor<Self> {
+        launch_image_backward(pred, gt_packed, dl_dpartials, cfg)
+    }
+
+    fn unpack_gt_rgb(gt_packed: IntTensor<Self>, composite_bg: Option<Vec3>) -> FloatTensor<Self> {
+        launch_unpack_gt_rgb(gt_packed, composite_bg)
+    }
+}
+
+#[derive(Debug)]
+struct ImageLossBackward;
+
+#[derive(Debug, Clone)]
+struct ImageLossState<B: Backend> {
+    pred: FloatTensor<B>,
+    gt_packed: IntTensor<B>,
+    cfg: ImageLossConfig,
+}
+
+impl<B: Backend + LossOps> Backward<B, 1> for ImageLossBackward {
+    type State = ImageLossState<B>;
+
+    fn backward(
+        self,
+        ops: Ops<Self::State, 1>,
+        grads: &mut Gradients,
+        _checkpointer: &mut Checkpointer,
+    ) {
+        let state = ops.state;
+        let dl_dpartials = grads.consume::<B>(&ops.node);
+        let [pred_parent] = ops.parents;
+        let dl_dpred = B::image_loss_backward(state.pred, state.gt_packed, dl_dpartials, state.cfg);
+        if let Some(node) = pred_parent {
+            grads.register::<B>(node.id, dl_dpred);
+        }
+    }
+}
+
+/// L1 + SSIM image loss with optional bg-compositing, masking and alpha
+/// matching, folded into a single kernel that also reduces each tile. `pred`
+/// is `[H, W, C]` with 3 or 4 channels, on an autodiff-enabled device.
+pub fn image_loss(pred: Tensor<3>, gt_packed: Tensor<2, Int>, cfg: ImageLossConfig) -> Tensor<1> {
+    image_loss_partials(pred, gt_packed, cfg).sum()
+}
+
+/// The pieces of [`image_loss`] before the final sum: weighted per-tile
+/// sums `[planes, tiles]` (rows r, g, b, and alpha when matching), tiles in
+/// row-major order with [`TILE_SIZE`] pixels a side. For tests that want to
+/// probe part of the image.
+pub fn image_loss_partials(
+    pred: Tensor<3>,
+    gt_packed: Tensor<2, Int>,
+    cfg: ImageLossConfig,
+) -> Tensor<2> {
+    let partials = <burn::backend::Dispatch as LossOps>::image_loss_forward(
+        pred.into_dispatch(),
+        gt_packed.into_dispatch(),
+        cfg,
+        true,
+    );
+    Tensor::<2>::from_dispatch(partials)
+}
+
+impl<B: Backend + LossOps, C: CheckpointStrategy> LossOps for Autodiff<B, C> {
+    fn image_loss_forward(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        cfg: ImageLossConfig,
+        reduce: bool,
+    ) -> FloatTensor<Self> {
+        if !reduce {
+            // The per-pixel map is eval-only; gradients go through the
+            // reduced form.
+            return <Self as AutodiffBackend>::from_inner(<B as LossOps>::image_loss_forward(
+                pred.into_primitive(),
+                gt_packed,
+                cfg,
+                false,
+            ));
+        }
+
+        let prep = ImageLossBackward
+            .prepare::<NoCheckpointing>([pred.node()])
+            .compute_bound()
+            .stateful();
+
+        let pred_p = pred.into_primitive();
+        let partials =
+            <B as LossOps>::image_loss_forward(pred_p.clone(), gt_packed.clone(), cfg, true);
+
+        match prep {
+            OpsKind::Tracked(prep) => prep.finish(
+                ImageLossState {
+                    pred: pred_p,
+                    gt_packed,
+                    cfg,
+                },
+                partials,
+            ),
+            OpsKind::UnTracked(prep) => prep.finish(partials),
+        }
+    }
+
+    fn image_loss_backward(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        dl_dpartials: FloatTensor<Self>,
+        cfg: ImageLossConfig,
+    ) -> FloatTensor<Self> {
+        <Self as AutodiffBackend>::from_inner(<B as LossOps>::image_loss_backward(
+            pred.into_primitive(),
+            gt_packed,
+            dl_dpartials.into_primitive(),
+            cfg,
+        ))
+    }
+
+    fn unpack_gt_rgb(gt_packed: IntTensor<Self>, composite_bg: Option<Vec3>) -> FloatTensor<Self> {
+        <Self as AutodiffBackend>::from_inner(<B as LossOps>::unpack_gt_rgb(
+            gt_packed,
+            composite_bg,
+        ))
+    }
+}
+
+/// Forward-only loss map for non-differentiable backends. Same kernel as
+/// the training forward; eval picks `cfg` to compute SSIM, L1, or whatever
+/// combination it needs (e.g. MSE = `l1_eval(...).powi(2).mean()`).
+pub fn image_loss_eval(
+    pred: Tensor<3>,
+    gt_packed: Tensor<2, Int>,
+    cfg: ImageLossConfig,
+) -> Tensor<3> {
+    let map = <burn::backend::Dispatch as LossOps>::image_loss_forward(
+        pred.into_dispatch(),
+        gt_packed.into_dispatch(),
+        cfg,
+        false,
+    );
+    Tensor::<3>::from_dispatch(map)
+}
+
+/// Smallest MSE PSNR distinguishes: identical images report 100 dB instead
+/// of infinity, which would poison any average or plot it feeds.
+const PSNR_MIN_MSE: f32 = 1e-10;
+
+/// PSNR in dB from a mean squared error between images in `[0, 1]`.
+pub fn psnr_from_mse(mse: Tensor<1>) -> Tensor<1> {
+    mse.clamp_min(PSNR_MIN_MSE).recip().log() * (10.0 / std::f32::consts::LN_10)
+}
+
+/// PSNR in dB between two `[H, W, 3]` images in `[0, 1]`.
+pub fn psnr(a: Tensor<3>, b: Tensor<3>) -> Tensor<1> {
+    psnr_from_mse((a - b).powi_scalar(2).mean())
+}
+
+/// Decode `gt_packed` back to a `[H, W, 3]` f32 RGB tensor. `composite_bg =
+/// Some(bg)` folds in `gt + (1 - gt.a) * bg`; `None` skips that math.
+/// Materialising f32 GT defeats the whole point of the packed format, so
+/// this is reserved for the LPIPS path which feeds f32 RGB into a VGG
+/// forward and has no kernel-fused alternative today.
+pub fn unpack_gt_rgb(gt_packed: Tensor<2, Int>, composite_bg: Option<Vec3>) -> Tensor<3> {
+    let out = <burn::backend::Dispatch as LossOps>::unpack_gt_rgb(
+        gt_packed.into_dispatch(),
+        composite_bg,
+    );
+    Tensor::from_dispatch(out)
+}

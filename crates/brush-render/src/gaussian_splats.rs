@@ -1,0 +1,621 @@
+use burn::{
+    Tensor,
+    backend::Dispatch,
+    module::{Module, Param, ParamId},
+    tensor::{Device, Gradients, TensorData, activation::sigmoid, s},
+};
+use clap::ValueEnum;
+use glam::Vec3;
+use tracing::trace_span;
+
+use crate::{
+    RenderAux, SplatOps,
+    camera::Camera,
+    sh::{sh_coeffs_for_degree, sh_degree_from_coeffs},
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SplatRenderMode {
+    Default,
+    Mip,
+}
+
+/// Forward/backward rasterizer mode. Replaces the old `bwd_info: bool` so the
+/// test-only smooth-cutoff variant rides along on the same enum that already
+/// switches in/out the backward bookkeeping.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub enum RasterPass {
+    /// Forward only — inference / eval. No backward bookkeeping, hard
+    /// `alpha >= 1/255` cutoff.
+    #[default]
+    Forward,
+    /// Forward + backward bookkeeping (training). Hard cutoff.
+    Backward,
+    /// Backward + C^1 smoothstep around the alpha=1/255 cutoff. Test-only:
+    /// makes the analytical backward agree with finite-diff at the cutoff,
+    /// at the cost of a sub-1/255 forward shift on edge pixels.
+    BackwardSmoothCutoff,
+}
+
+impl RasterPass {
+    pub const fn bwd_info(self) -> bool {
+        !matches!(self, Self::Forward)
+    }
+    pub const fn smooth_cutoff(self) -> bool {
+        matches!(self, Self::BackwardSmoothCutoff)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextureMode {
+    Packed,
+    #[default]
+    Float,
+}
+
+/// Wrap a tensor as a trainable parameter.
+///
+/// Splats usually live on the plain (non-autodiff) device and are lifted with
+/// `train()` for each step. On that device `require_grad()` is a no-op, so
+/// `Param::initialized` would record the parameter as inactive and `train()`
+/// would then lift it *without* gradient tracking. `set_require_grad` records
+/// the intent on the param itself, which `train()` honours on any device.
+fn trainable_param<const D: usize>(id: ParamId, tensor: Tensor<D>) -> Param<Tensor<D>> {
+    Param::initialized(id, tensor.detach()).set_require_grad(true)
+}
+
+/// Gaussian splat parameters.
+///
+/// `transforms` stores means(3) + rotations(4) + log scales(3) = 10 floats per splat
+/// as a single contiguous [N, 10] tensor to minimize GPU shader bindings.
+#[derive(Module, Debug)]
+pub struct Splats {
+    pub transforms: Param<Tensor<2>>,
+    pub sh_coeffs: Param<Tensor<3>>,
+    pub raw_opacities: Param<Tensor<1>>,
+    #[module(skip)]
+    pub render_mip: bool,
+    /// Optional per-splat world-space scale floor (Mip-Splatting's 3D filter).
+    /// Frozen, camera-derived, never optimized and never exported — a pure
+    /// training-time pressure. When set, the render path inflates each splat's
+    /// covariance to `sqrt(scale² + f²)` and energy-compensates opacity. `[N]`.
+    #[module(skip)]
+    pub min_scale: Option<Tensor<1>>,
+}
+
+pub fn inverse_sigmoid(x: f32) -> f32 {
+    (x / (1.0 - x)).ln()
+}
+
+/// Mip-Splatting 3D smoothing filter on the host: fold a per-splat world-space
+/// scale floor `f` `[N]` into the packed `transforms` `[N,10]` and `raw_opac`
+/// `[N]`. Scales become `sqrt(s² + f²)` and opacity is energy-compensated by
+/// `Π s / s'` over the three world axes. The render kernels apply the same
+/// floor themselves (`kernels::helpers::apply_scale_floor`); this copy serves
+/// [`Splats::bake_min_scale`] and the `opacities()` / `scales()` readouts.
+pub fn fold_min_scale(
+    transforms: Tensor<2>,
+    raw_opac: Tensor<1>,
+    f: Tensor<1>,
+) -> (Tensor<2>, Tensor<1>) {
+    // `f` is stored on the inner backend but the params may be lifted to
+    // autodiff; align it so the elementwise mix below stays on one backend.
+    let f = crate::burn_glue::match_backend(f, &transforms);
+    let n = transforms.dims()[0] as i32;
+    let log_scales = transforms.clone().slice(s![.., 7..10]); // [N,3]
+    let s2 = log_scales.clone().mul_scalar(2.0).exp(); // s² = exp(2·log) [N,3]
+    let f2 = f.clone().mul(f).reshape([n, 1]); // [N,1]
+    let s2f = s2.add(f2); // s² + f² [N,3]
+
+    let new_log = s2f.log().mul_scalar(0.5); // log(sqrt(s²+f²)) [N,3]
+    // `cat` fuses; a `slice_assign` would make burn run the block eagerly.
+    let transforms = Tensor::cat(vec![transforms.slice(s![.., 0..7]), new_log.clone()], 1);
+
+    let coef = log_scales.sub(new_log).sum_dim(1).exp().reshape([n]);
+    let opac = sigmoid(raw_opac).mul(coef).clamp(1e-6, 1.0 - 1e-6);
+    let raw_opac = opac.clone().div(opac.neg().add_scalar(1.0)).log(); // logit
+
+    (transforms, raw_opac)
+}
+
+impl Splats {
+    pub fn from_raw(
+        pos_data: Vec<f32>,
+        rot_data: Vec<f32>,
+        scale_data: Vec<f32>,
+        coeffs_data: Vec<f32>,
+        opac_data: Vec<f32>,
+        mode: SplatRenderMode,
+        device: &Device,
+    ) -> Self {
+        let _ = trace_span!("Splats::from_raw").entered();
+        let n_splats = pos_data.len() / 3;
+        let log_scales = Tensor::from_data(TensorData::new(scale_data, [n_splats, 3]), device);
+        let means_tensor = Tensor::from_data(TensorData::new(pos_data, [n_splats, 3]), device);
+        let rotations = Tensor::from_data(TensorData::new(rot_data, [n_splats, 4]), device);
+        let n_coeffs = coeffs_data.len() / n_splats;
+        let sh_coeffs = Tensor::from_data(
+            TensorData::new(coeffs_data, [n_splats, n_coeffs / 3, 3]),
+            device,
+        );
+        let raw_opacities = Tensor::from_data(TensorData::new(opac_data, [n_splats]), device);
+        Self::from_tensor_data(
+            means_tensor,
+            rotations,
+            log_scales,
+            sh_coeffs,
+            raw_opacities,
+            mode,
+        )
+    }
+
+    /// Set the SH degree of this splat to be equal to `sh_degree`
+    pub fn with_sh_degree(mut self, sh_degree: u32) -> Self {
+        let n_coeffs = sh_coeffs_for_degree(sh_degree) as usize;
+        let n = self.num_splats() as usize;
+
+        self.sh_coeffs = self.sh_coeffs.map(|coeffs| {
+            let device = coeffs.device();
+            let cur = coeffs.dims()[1];
+            if cur < n_coeffs {
+                let zeros = Tensor::<3>::zeros([n, n_coeffs - cur, 3], &device);
+                Tensor::cat(vec![coeffs, zeros], 1)
+            } else {
+                coeffs.slice(s![.., 0..n_coeffs])
+            }
+            // `Param::map` keeps the configured training state; a raw
+            // `require_grad` would panic on a plain (non-autodiff) device.
+            .detach()
+        });
+        self
+    }
+
+    pub fn from_tensor_data(
+        means: Tensor<2>,
+        rotation: Tensor<2>,
+        log_scales: Tensor<2>,
+        sh_coeffs: Tensor<3>,
+        raw_opacity: Tensor<1>,
+        mode: SplatRenderMode,
+    ) -> Self {
+        assert_eq!(means.dims()[1], 3, "Means must be 3D");
+        assert_eq!(rotation.dims()[1], 4, "Rotation must be 4D");
+        assert_eq!(log_scales.dims()[1], 3, "Scales must be 3D");
+
+        let transforms = Tensor::cat(vec![means, rotation, log_scales], 1);
+
+        Self {
+            transforms: trainable_param(ParamId::new(), transforms),
+            sh_coeffs: trainable_param(ParamId::new(), sh_coeffs),
+            raw_opacities: trainable_param(ParamId::new(), raw_opacity),
+            render_mip: mode == SplatRenderMode::Mip,
+            min_scale: None,
+        }
+    }
+
+    /// Uniformly rescale the splats about the origin: means are multiplied by
+    /// `factor`, log scales shift by `ln(factor)`, and any attached min-scale
+    /// floor scales along. Rotations, colors and opacities are unchanged. Used
+    /// to move between dataset units and the metres training runs in.
+    pub fn scaled(mut self, factor: f32) -> Self {
+        let transforms = self.transforms.val();
+        let means = transforms.clone().slice(s![.., 0..3]).mul_scalar(factor);
+        let log_scales = transforms
+            .clone()
+            .slice(s![.., 7..10])
+            .add_scalar(factor.ln());
+        let transforms = transforms
+            .slice_assign(s![.., 0..3], means)
+            .slice_assign(s![.., 7..10], log_scales);
+        self.transforms = trainable_param(self.transforms.id, transforms);
+        self.min_scale = self.min_scale.map(|f| f.mul_scalar(factor));
+        self
+    }
+
+    /// Attach a per-splat world-space scale floor (see [`Splats::min_scale`]).
+    /// `f` must be `[num_splats]`. Training-only; cleared by refine and never
+    /// serialized.
+    pub fn with_min_scale(mut self, f: Tensor<1>) -> Self {
+        self.min_scale = Some(f);
+        self
+    }
+
+    /// The floor as the render trait takes it: the `[N]` tensor and whether
+    /// it's real. Without a floor the tensor is a `[1]` placeholder the
+    /// kernels never read. Lives on the inner backend either way.
+    pub fn min_scale_arg(&self) -> (Tensor<1>, bool) {
+        match &self.min_scale {
+            Some(f) => (f.clone(), true),
+            None => (Tensor::zeros([1], &self.device().inner()), false),
+        }
+    }
+
+    /// Get means (positions) — slice of transforms columns 0..3.
+    pub fn means(&self) -> Tensor<2> {
+        self.transforms.val().slice(s![.., 0..3])
+    }
+
+    /// Get rotation quaternions — slice of transforms columns 3..7.
+    pub fn rotations(&self) -> Tensor<2> {
+        self.transforms.val().slice(s![.., 3..7])
+    }
+
+    /// Get log-space scales — slice of transforms columns 7..10.
+    pub fn log_scales(&self) -> Tensor<2> {
+        self.transforms.val().slice(s![.., 7..10])
+    }
+
+    /// `(transforms, raw_opacities)` with the 3D-filter floor folded in when
+    /// a `min_scale` is set (see [`fold_min_scale`]), otherwise the params as
+    /// stored. What the splat really renders as.
+    fn folded(&self) -> (Tensor<2>, Tensor<1>) {
+        let (transforms, raw_opac) = (self.transforms.val(), self.raw_opacities.val());
+        match &self.min_scale {
+            Some(f) => fold_min_scale(transforms, raw_opac, f.clone()),
+            None => (transforms, raw_opac),
+        }
+    }
+
+    /// Post-activation opacity, with the 3D-filter energy compensation folded
+    /// in. This is the splat's *real* opacity — callers (export, refine
+    /// decisions, viewer) should use it rather than reaching for
+    /// `raw_opacities`.
+    pub fn opacities(&self) -> Tensor<1> {
+        sigmoid(self.folded().1)
+    }
+
+    /// World-space scales, with the 3D-filter floor folded in:
+    /// `sqrt(scale² + f²)`. This is the splat's *real* size — the floor is
+    /// part of the splat's definition, so renders/exports use this, not the
+    /// raw `log_scales`.
+    pub fn scales(&self) -> Tensor<2> {
+        self.folded().0.slice(s![.., 7..10]).exp()
+    }
+
+    /// Permanently fold the `min_scale` floor into the raw scale/opacity params
+    /// and clear it, yielding a plain canonical splat that renders identically.
+    /// Used at ply export so the floor is written as ordinary derived scales —
+    /// never as a separate field.
+    pub fn bake_min_scale(mut self) -> Self {
+        if self.min_scale.is_some() {
+            let (transforms, raw_opac) = self.folded();
+            self.min_scale = None;
+            self.transforms = trainable_param(self.transforms.id, transforms);
+            self.raw_opacities = trainable_param(self.raw_opacities.id, raw_opac);
+        }
+        self
+    }
+
+    pub fn num_splats(&self) -> u32 {
+        self.transforms.dims()[0] as u32
+    }
+
+    pub fn sh_degree(&self) -> u32 {
+        let [_, n_coeffs, _] = self.sh_coeffs.dims();
+        sh_degree_from_coeffs(n_coeffs as u32)
+    }
+
+    pub fn device(&self) -> Device {
+        self.transforms.device()
+    }
+
+    pub async fn validate_values(self) {
+        #[cfg(any(test, feature = "debug-validation"))]
+        {
+            if !crate::validation::enabled() {
+                return;
+            }
+            crate::validation::warn_once();
+
+            use crate::validation::validate_tensor_val;
+
+            let num_splats = self.num_splats();
+
+            // Validate means (positions)
+            validate_tensor_val(self.means(), "means", None, None).await;
+            // Validate rotations
+            validate_tensor_val(self.rotations(), "rotations", None, None).await;
+            // Validate pre-activation scales (log_scales) and post-activation scales
+            validate_tensor_val(self.log_scales(), "log_scales", Some(-10.0), Some(10.0)).await;
+            let scales = self.scales();
+            validate_tensor_val(scales.clone(), "scales", Some(1e-20), Some(10000.0)).await;
+            // Validate SH coefficients
+            validate_tensor_val(self.sh_coeffs.val(), "sh_coeffs", Some(-5.0), Some(5.0)).await;
+            // Validate pre-activation opacity (raw_opacity) and post-activation opacity
+            validate_tensor_val(
+                self.raw_opacities.val(),
+                "raw_opacity",
+                Some(-20.0),
+                Some(20.0),
+            )
+            .await;
+            let opacities = self.opacities();
+            validate_tensor_val(opacities, "opacities", Some(0.0), Some(1.0)).await;
+            // Range validation if requested
+            // Scales should be positive and reasonable
+            validate_tensor_val(scales, "scales", Some(1e-6), Some(100.0)).await;
+
+            let [n_transforms, t_dims] = self.transforms.dims();
+            assert_eq!(
+                t_dims, 10,
+                "Transforms must be 10D (means(3) + quats(4) + log_scales(3))"
+            );
+            assert_eq!(
+                n_transforms, num_splats as usize,
+                "Inconsistent number of splats in transforms"
+            );
+            let [n_opacity] = self.raw_opacities.dims();
+            assert_eq!(
+                n_opacity, num_splats as usize,
+                "Inconsistent number of splats in opacity"
+            );
+            let [n_sh, _, sh_dims] = self.sh_coeffs.dims();
+            assert_eq!(sh_dims, 3, "SH coeffs must have 3 color channels");
+            assert_eq!(
+                n_sh, num_splats as usize,
+                "Inconsistent number of splats in SH coeffs"
+            );
+        }
+    }
+
+    /// Post-backward variant of `validate_values`, checks that no splat
+    /// parameter gradient has a NaN or Inf. Debug-only.
+    #[allow(unused_variables)]
+    pub async fn bwd_validate(&self, loss: Tensor<1>) -> Gradients {
+        let grads = loss.backward();
+        #[cfg(any(test, feature = "debug-validation"))]
+        let (t, sh, opac) = (
+            self.transforms.grad(&grads),
+            self.sh_coeffs.grad(&grads),
+            self.raw_opacities.grad(&grads),
+        );
+
+        #[cfg(any(test, feature = "debug-validation"))]
+        {
+            use crate::validation::validate_gradient;
+
+            if !crate::validation::enabled() {
+                return grads;
+            }
+            crate::validation::warn_once();
+            if let Some(g) = t {
+                validate_gradient(g, "transforms").await;
+            }
+            if let Some(g) = sh {
+                validate_gradient(g, "sh_coeffs").await;
+            }
+            if let Some(g) = opac {
+                validate_gradient(g, "raw_opacities").await;
+            }
+        }
+
+        grads
+    }
+}
+
+/// Render splats on a non-differentiable device.
+pub async fn render_splats(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    splat_scale: Option<f32>,
+    texture_mode: TextureMode,
+) -> (Tensor<3>, RenderAux) {
+    splats.clone().validate_values().await;
+
+    // The 3D-filter floor is part of the splat's definition, so eval/viewer
+    // render with it just like training; the projection kernels fold it in.
+    let (min_scale, has_min_scale) = splats.min_scale_arg();
+    let sh_coeffs = splats.sh_coeffs.into_value();
+    let transforms = splats.transforms.val();
+    let raw_opacities = splats.raw_opacities.val();
+
+    let transforms = if let Some(scale) = splat_scale {
+        let adjusted = transforms.clone().slice(s![.., 7..10]) + scale.ln();
+        transforms.slice_assign(s![.., 7..10], adjusted)
+    } else {
+        transforms
+    };
+
+    let render_mode = if splats.render_mip {
+        SplatRenderMode::Mip
+    } else {
+        SplatRenderMode::Default
+    };
+
+    let use_float = matches!(texture_mode, TextureMode::Float);
+    let render_device = transforms.device();
+
+    // Float mode needs `Backward` (f32 image + per-splat bookkeeping); Packed
+    // mode goes through the packed u8 path. Neither inference path uses the
+    // smooth cutoff — that's reserved for the gradient-check tests.
+    let pass = if use_float {
+        RasterPass::Backward
+    } else {
+        RasterPass::Forward
+    };
+    // Route through the `#[backend_extension]`-generated `Dispatch` impl: it
+    // unwraps these dispatch primitives to the Wgpu backend, runs the render,
+    // and re-wraps the `RenderOutput` via its `ExtensionType` derive.
+    let output = <Dispatch as SplatOps>::render(
+        camera,
+        img_size,
+        transforms.into_dispatch(),
+        sh_coeffs.into_dispatch(),
+        raw_opacities.into_dispatch(),
+        min_scale.into_dispatch(),
+        has_min_scale,
+        // Inference path: no gradients, so the backward accumulators are
+        // throwaway scalars the concrete backends ignore.
+        Tensor::<1>::zeros([1], &render_device).into_dispatch(),
+        Tensor::<1>::zeros([1], &render_device).into_dispatch(),
+        render_mode,
+        background,
+        pass,
+    )
+    .await;
+
+    output.clone().validate().await;
+
+    let img_size = output.aux.img_size;
+    let num_visible = output.aux.num_visible;
+    let num_intersections = output.aux.num_intersections;
+
+    let aux = RenderAux {
+        num_visible,
+        num_intersections,
+        visible: Tensor::from_dispatch(output.aux.visible),
+        max_radius: Tensor::from_dispatch(output.aux.max_radius),
+        opacities: Tensor::from_dispatch(output.aux.opacities),
+        tile_offsets: Tensor::from_dispatch(output.aux.tile_offsets),
+        img_size,
+    };
+
+    (Tensor::from_dispatch(output.out_img), aux)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::module::Module;
+
+    /// Splats are built on the plain device and lifted with `train()` for each
+    /// step. That lift must arm gradient tracking on every parameter, and keep
+    /// it armed across `valid()`/`train()` round trips and min-scale baking.
+    #[tokio::test]
+    async fn splats_built_on_plain_device_train_with_gradients() {
+        let device = Device::from(brush_cube::test_helpers::test_device().await);
+        let n = 4;
+        let splats = Splats::from_tensor_data(
+            Tensor::zeros([n, 3], &device),
+            Tensor::ones([n, 4], &device),
+            Tensor::zeros([n, 3], &device),
+            Tensor::zeros([n, 1, 3], &device),
+            Tensor::zeros([n], &device),
+            SplatRenderMode::Default,
+        );
+
+        let assert_tracked = |splats: &Splats, what: &str| {
+            assert!(splats.device().is_autodiff(), "{what}: not lifted");
+            assert!(
+                splats.transforms.val().is_require_grad(),
+                "{what}: transforms not tracked"
+            );
+            assert!(
+                splats.sh_coeffs.val().is_require_grad(),
+                "{what}: sh_coeffs not tracked"
+            );
+            assert!(
+                splats.raw_opacities.val().is_require_grad(),
+                "{what}: raw_opacities not tracked"
+            );
+        };
+
+        let diff = splats.clone().train();
+        assert_tracked(&diff, "first lift");
+
+        let round_trip = diff.valid().train();
+        assert_tracked(&round_trip, "valid/train round trip");
+
+        let baked = splats
+            .with_min_scale(Tensor::ones([n], &device))
+            .bake_min_scale()
+            .train();
+        assert_tracked(&baked, "after bake_min_scale");
+    }
+
+    #[tokio::test]
+    async fn min_scale_fold_is_stable_for_tiny_scales() {
+        let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let log_scale = -20.0_f32;
+        let mut data = vec![0.0; 10];
+        data[7..10].fill(log_scale);
+        let transforms = Tensor::from_data(TensorData::new(data, [1, 10]), &device).require_grad();
+        let source = transforms.clone();
+        let (_, raw_opacity) = fold_min_scale(
+            transforms,
+            Tensor::zeros([1], &device),
+            Tensor::from_floats([log_scale.exp()], &device),
+        );
+
+        let opacity = sigmoid(raw_opacity.clone())
+            .into_scalar_async::<f32>()
+            .await
+            .expect("opacity readback");
+        let grads = raw_opacity.sum().backward();
+        let gradient = source
+            .grad(&grads)
+            .expect("transform gradient")
+            .into_data_async()
+            .await
+            .expect("gradient readback")
+            .try_to_vec::<f32>()
+            .expect("f32 gradient");
+
+        let expected_opacity = 0.5 * 0.5_f32.sqrt().powi(3);
+        assert!((opacity - expected_opacity).abs() < 1e-6);
+        let expected_gradient = 0.5 / (1.0 - expected_opacity);
+        for actual in &gradient[7..10] {
+            assert!(
+                actual.is_finite() && (actual - expected_gradient).abs() < 2e-4,
+                "unexpected gradient {actual}"
+            );
+        }
+    }
+
+    async fn read_vec(t: Tensor<2>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scaled_moves_means_scales_and_floor() {
+        let device = Device::from(brush_cube::test_helpers::test_device().await);
+        let n = 2;
+        let splats = Splats::from_tensor_data(
+            Tensor::from_floats([[1.0, -2.0, 3.0], [0.5, 0.0, -1.0]], &device),
+            Tensor::ones([n, 4], &device),
+            Tensor::from_floats([[0.0, 1.0, -1.0], [2.0, 2.0, 2.0]], &device),
+            Tensor::zeros([n, 1, 3], &device),
+            Tensor::zeros([n], &device),
+            SplatRenderMode::Default,
+        )
+        .with_min_scale(Tensor::from_floats([0.1, 0.2], &device));
+
+        let scaled = splats.clone().scaled(4.0);
+        let means = read_vec(splats.means()).await;
+        let scaled_means = read_vec(scaled.means()).await;
+        let scales = read_vec(splats.log_scales().exp()).await;
+        let scaled_scales = read_vec(scaled.log_scales().exp()).await;
+        for i in 0..n * 3 {
+            assert!((scaled_means[i] - means[i] * 4.0).abs() < 1e-6);
+            assert!((scaled_scales[i] - scales[i] * 4.0).abs() < 1e-5 * scales[i]);
+        }
+        let floor = scaled
+            .min_scale
+            .clone()
+            .expect("floor kept")
+            .into_data_async()
+            .await
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert!((floor[0] - 0.4).abs() < 1e-6 && (floor[1] - 0.8).abs() < 1e-6);
+        // Rotations and opacities are untouched.
+        assert_eq!(
+            read_vec(scaled.rotations()).await,
+            read_vec(splats.rotations()).await
+        );
+
+        // Scaling back is the identity (up to rounding).
+        let back = read_vec(scaled.scaled(0.25).means()).await;
+        for i in 0..n * 3 {
+            assert!((back[i] - means[i]).abs() < 1e-6);
+        }
+    }
+}

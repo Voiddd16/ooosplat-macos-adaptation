@@ -1,0 +1,57 @@
+// Static tasks configuration.
+//
+// Example:
+[
+  {
+    "label": "debug",
+    "command": "cargo run",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "info,wgpu_core=off"
+    },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always",
+    "hide": "never",
+    "shell": "system"
+  },
+  {
+    "label": "release",
+    "command": "cargo run",
+    "args": ["--release"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always",
+    "hide": "never",
+    "shell": "system",
+    "env": {
+      "RUST_LOG": "warn"
+    }
+  },
+  {
+    "label": "test rendering",
+    "command": "cargo test",
+    "args": ["-p brush-train -- --nocapture"],
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always",
+    "hide": "never",
+    "shell": "system"
+  },
+  {
+    "label": "bench rendering",
+    "command": "cargo bench",
+    "args": ["-p brush-render"],
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always",
+    "hide": "never",
+    "shell": "system"
+  }
+]

@@ -1,0 +1,112 @@
+// Microbenchmarks for the radix sort. Lives inside brush-sort so we can
+// measure the sort kernels in isolation, separately from any rendering work.
+//
+// Each bench preallocates the input buffers once outside the timed block and
+// only times the radix_argsort dispatch + a final readback to force the GPU to
+// finish. The buffers are built directly as CubeTensors (DType::U32) instead
+// of going through Burn's typed `Tensor::<_, _, Int>::from_ints`, so we can
+// sort the full u32 range — Burn's i32-typed constructor would panic on any
+// value with the high bit set.
+
+#![cfg_attr(target_family = "wasm", allow(unused_imports, dead_code))]
+
+use std::sync::Arc;
+
+use brush_cube::{CubeDevice, CubeTensor, create_tensor_from_slice};
+use brush_sort::radix_argsort;
+use burn::backend::TensorMetadata;
+use burn::cubecl::future::block_on;
+use burn::tensor::DType;
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    divan::main();
+}
+
+#[cfg(target_family = "wasm")]
+fn main() {}
+
+// Sizes spanning the interesting range:
+// - 1M  : "normal" frame, well below any cliff
+// - 10M : medium frame
+// - 30M : ~max prior to the sort_scan fix
+// - 70M : just past the old `num_reduce_wgs > BLOCK_SIZE` cliff at ~67M
+const SIZES: [usize; 4] = [1_000_000, 10_000_000, 30_000_000, 70_000_000];
+
+// Number of distinct tile-id values to use for tile-id-shaped sorts.
+// 1024 matches the renderer's tile budget for a 512x512 image.
+const TILE_ID_RANGE: u32 = 1024;
+
+fn device() -> CubeDevice {
+    CubeDevice::Wgpu(block_on(brush_cube::test_helpers::test_device()))
+}
+
+#[derive(Copy, Clone)]
+enum KeyKind {
+    // Narrow keys in [0, 1024) — matches the renderer's tile-sort workload.
+    // Sort runs with 10 sorting bits => 3 radix passes.
+    TileIds,
+    // Full 32-bit random keys — matches what the depth sort would do if depths
+    // were transmuted to u32 (which is what the gaussian-splat depth sort does
+    // internally for non-negative floats). 8 radix passes.
+    Random32,
+}
+
+// Generate keys + values once and return an Arc'd vector for cheap cloning.
+fn make_inputs(size: usize, key_kind: KeyKind) -> Arc<(Vec<u32>, Vec<u32>)> {
+    use std::num::Wrapping;
+    let mut state = Wrapping(0xC0FFEEu64 ^ (size as u64).rotate_left(17));
+    let mut next_u32 = || {
+        state += Wrapping(0x9E3779B97F4A7C15u64);
+        let mut z = state.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        z as u32
+    };
+
+    let keys: Vec<u32> = match key_kind {
+        KeyKind::TileIds => (0..size).map(|_| next_u32() % TILE_ID_RANGE).collect(),
+        KeyKind::Random32 => (0..size).map(|_| next_u32()).collect(),
+    };
+    let values: Vec<u32> = (0..size as u32).collect();
+    Arc::new((keys, values))
+}
+
+// Raw u32 upload: burn's i32-typed `from_ints` would reject keys >= 2^31.
+fn upload_u32(device: &CubeDevice, data: &[u32]) -> CubeTensor {
+    create_tensor_from_slice(data, device, DType::U32)
+}
+
+fn run_sort(device: &CubeDevice, keys: &CubeTensor, values: &CubeTensor, bits: u32) {
+    let (sorted_keys, _sorted_values) = radix_argsort(keys.clone(), values.clone(), bits);
+    // Force completion with a minimal readback: the last key only.
+    let client = device.client();
+    let len = sorted_keys.shape()[0] as u64;
+    let last = sorted_keys.handle.offset_start((len - 1) * 4);
+    let _ = block_on(client.read_async(vec![last]));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[divan::bench_group(max_time = 4)]
+mod sort_bench {
+    use crate::{KeyKind, SIZES, device, make_inputs, run_sort};
+
+    #[divan::bench(args = SIZES)]
+    fn radix_argsort_10bit(bencher: divan::Bencher, size: usize) {
+        let dev = device();
+        let inputs = make_inputs(size, KeyKind::TileIds);
+        let keys = crate::upload_u32(&dev, &inputs.0);
+        let values = crate::upload_u32(&dev, &inputs.1);
+        bencher.bench_local(move || run_sort(&dev, &keys, &values, 10));
+    }
+
+    #[divan::bench(args = SIZES)]
+    fn radix_argsort_32bit(bencher: divan::Bencher, size: usize) {
+        let dev = device();
+        let inputs = make_inputs(size, KeyKind::Random32);
+        let keys = crate::upload_u32(&dev, &inputs.0);
+        let values = crate::upload_u32(&dev, &inputs.1);
+        bencher.bench_local(move || run_sort(&dev, &keys, &values, 32));
+    }
+}

@@ -1,0 +1,19 @@
+[workspace]
+members = ["cargo:./apps/brush-app"]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.30.3"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = []
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
+# Pin GitHub Actions to specific versions
+[dist.github-action-commits]
+"actions/checkout" = "v6"
+"actions/upload-artifact" = "v7"
+"actions/download-artifact" = "v8"

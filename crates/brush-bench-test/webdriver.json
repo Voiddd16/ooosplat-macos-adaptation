@@ -1,0 +1,17 @@
+{
+  "goog:chromeOptions": {
+    "args": [
+      "--headless=new",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+
+      "--enable-unsafe-webgpu",
+      "--enable-webgpu-developer-features",
+      "--enable-dawn-features=allow_unsafe_apis,use_user_defined_labels_in_backend",
+
+      "--enable-features=Vulkan",
+      "--use-vulkan=native",
+      "--enable-unsafe-swiftshader"
+    ]
+  }
+}

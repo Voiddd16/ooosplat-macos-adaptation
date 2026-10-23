@@ -1,0 +1,60 @@
+[package]
+name = "brush-bench-test"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+brush-render = { path = "../brush-render", features = ["debug-validation"] }
+brush-train.path = "../brush-train"
+brush-dataset.path = "../brush-dataset"
+
+anyhow.workspace = true
+glam.workspace = true
+log.workspace = true
+burn = { workspace = true, features = ["autodiff"] }
+burn-cubecl.workspace = true
+rand.workspace = true
+
+divan = "0.1.17"
+safetensors.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+brush-rerun = { path = "../brush-rerun" }
+rerun = { workspace = true }
+
+[dev-dependencies]
+brush-async = { path = "../brush-async" }
+brush-cube = { path = "../brush-cube" }
+
+# `inspect` is how the fusion test reads back what burn fused.
+burn-fusion = { workspace = true, features = ["test-util"] }
+
+burn-wgpu.workspace = true
+bytemuck.workspace = true
+
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+# ahash (pulled in via burn-core) uses getrandom 0.3; enable its wasm_js feature
+# so the wasm_js cfg backend can compile.
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+wasm-logger = "0.2"
+console_error_panic_hook = "0.1"
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+env_logger = "0.11"
+
+[[bench]]
+name = "training_bench"
+harness = false
+path = "src/training_bench.rs"
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-shear]
+ignored = ["getrandom"]

@@ -1,0 +1,18 @@
+[package]
+name = "colmap-reader"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
+brush-async.path = "../brush-async"
+log.workspace = true
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[lints]
+workspace = true

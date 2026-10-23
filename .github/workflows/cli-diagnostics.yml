@@ -1,0 +1,181 @@
+name: CLI diagnostics, builds and releases
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['ooo-v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (ooo-v1.0.0 or ooo-v1.0.0-rc.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-diagnostics-${{ github.workflow }}-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  prepare:
+    name: Resolve build commit
+    runs-on: ubuntu-22.04
+    outputs:
+      commit: ${{ steps.prepare.outputs.commit }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      publishing: ${{ steps.prepare.outputs.publishing }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Test release lifecycle (no network or GPU)
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Resolve tag and exact source commit
+        id: prepare
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python3 -B .github/scripts/cli_release.py prepare
+
+  format:
+    name: Format
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  build:
+    name: Diagnostics and build (${{ matrix.target }})
+    needs: [prepare, format]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            suffix: .exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: ''
+          - os: macos-14
+            target: aarch64-apple-darwin
+            suffix: ''
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          lfs: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
+        with:
+          packages: libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+          version: 1.0
+          execute_install_scripts: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cli-diagnostics-v1
+          shared-key: cli-${{ matrix.target }}
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run diagnostics tests (no GPU required)
+        run: cargo test --locked -p brush-cli -p brush-process -p brush-async --lib
+      - name: Build both binaries
+        run: cargo build --locked --release -p brush-cli -p brush-app --bins --target ${{ matrix.target }}
+      - name: Smoke test command-line entrypoints
+        shell: bash
+        run: |
+          for binary in brush-cli brush; do
+            "target/${{ matrix.target }}/release/${binary}${{ matrix.suffix }}" --version | tee "${binary}.version.txt"
+            "target/${{ matrix.target }}/release/${binary}${{ matrix.suffix }}" --help
+          done
+      - name: Record actual binary versions and source commit
+        shell: bash
+        env:
+          BUILD_COMMIT: ${{ needs.prepare.outputs.commit }}
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          ${{ runner.os == 'Windows' && 'python' || 'python3' }} - <<'PY'
+          import json, os
+          from pathlib import Path
+          info = {
+              "commit": os.environ["BUILD_COMMIT"],
+              "target": os.environ["BUILD_TARGET"],
+              "versions": {name: Path(f"{name}.version.txt").read_text().strip() for name in ("brush-cli", "brush")},
+          }
+          Path("BUILDINFO.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+          PY
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/brush-cli.exe, target/${{ matrix.target }}/release/brush.exe, README.md, LICENSE, BUILDINFO.json -Destination package
+          Get-ChildItem package -File | Sort-Object Name | ForEach-Object {
+            $digest = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$digest  $($_.Name)"
+          } | Set-Content -Encoding utf8 package/SHA256SUMS
+          Compress-Archive -Path package/* -DestinationPath OOOBrush-${{ matrix.target }}.zip
+      - name: Package Linux and macOS binaries
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir package
+          cp "target/${{ matrix.target }}/release/brush-cli" "target/${{ matrix.target }}/release/brush" README.md LICENSE BUILDINFO.json package/
+          (
+            cd package
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              shasum -a 256 BUILDINFO.json LICENSE README.md brush brush-cli > SHA256SUMS
+            else
+              sha256sum BUILDINFO.json LICENSE README.md brush brush-cli > SHA256SUMS
+            fi
+          )
+          tar -czf "OOOBrush-${{ matrix.target }}.tar.gz" -C package .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: OOOBrush-${{ matrix.target }}
+          path: OOOBrush-${{ matrix.target }}.*
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: Publish complete three-platform Release
+    needs: [prepare, format, build]
+    if: ${{ needs.prepare.outputs.publishing == 'true' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ooo-v'))) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      # Use the workflow's release tools, even when a manual run builds an older tag.
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: OOOBrush-*
+          path: release-artifacts
+          merge-multiple: true
+      - name: Validate, upload to draft, verify and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: python3 -B .github/scripts/cli_release.py publish release-artifacts

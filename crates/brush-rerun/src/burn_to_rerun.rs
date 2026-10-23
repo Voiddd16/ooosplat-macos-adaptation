@@ -1,0 +1,120 @@
+use burn::cubecl::future::block_on;
+use burn::tensor::{Bool, Int, Tensor};
+use rerun::{ChannelDatatype, ColorModel};
+
+trait BurnToRerunData {
+    fn into_rerun_data(self) -> impl Future<Output = rerun::TensorData>;
+}
+
+impl<const D: usize> BurnToRerunData for Tensor<D> {
+    async fn into_rerun_data(self) -> rerun::TensorData {
+        rerun::TensorData::new(
+            self.dims().map(|x| x as u64).to_vec(),
+            rerun::TensorBuffer::F32(
+                self.into_data_async()
+                    .await
+                    .expect("Failed to fetch data")
+                    .try_into_vec::<f32>()
+                    .expect("Wrong type")
+                    .into(),
+            ),
+        )
+    }
+}
+
+impl<const D: usize> BurnToRerunData for Tensor<D, Int> {
+    async fn into_rerun_data(self) -> rerun::TensorData {
+        rerun::TensorData::new(
+            self.dims().map(|x| x as u64).to_vec(),
+            rerun::TensorBuffer::U32(
+                self.into_data_async()
+                    .await
+                    .expect("Failed to fetch data")
+                    .try_into_vec::<u32>()
+                    .expect("Wrong type")
+                    .into(),
+            ),
+        )
+    }
+}
+
+impl<const D: usize> BurnToRerunData for Tensor<D, Bool> {
+    async fn into_rerun_data(self) -> rerun::TensorData {
+        rerun::TensorData::new(
+            self.dims().map(|x| x as u64).to_vec(),
+            rerun::TensorBuffer::U8(
+                self.into_data_async()
+                    .await
+                    .expect("Failed to fetch data")
+                    .convert::<u8>()
+                    .try_into_vec()
+                    .expect("Wrong type")
+                    .into(),
+            ),
+        )
+    }
+}
+
+pub trait BurnToRerun: Sized {
+    fn into_rerun(self) -> impl Future<Output = rerun::Tensor>;
+    fn into_rerun_blocking(self) -> rerun::Tensor {
+        block_on(self.into_rerun())
+    }
+}
+
+impl<T: BurnToRerunData> BurnToRerun for T {
+    async fn into_rerun(self) -> rerun::Tensor {
+        rerun::Tensor::new(self.into_rerun_data().await)
+    }
+}
+
+pub trait BurnToImage: Sized {
+    fn into_rerun_image(self) -> impl Future<Output = rerun::Image>;
+
+    fn into_rerun_image_blocking(self) -> rerun::Image {
+        block_on(self.into_rerun_image())
+    }
+}
+
+impl BurnToImage for Tensor<3> {
+    async fn into_rerun_image(self) -> rerun::Image {
+        let [h, w, c] = self.dims();
+        let color_model = if c == 3 {
+            ColorModel::RGB
+        } else {
+            ColorModel::RGBA
+        };
+        rerun::Image::from_color_model_and_bytes(
+            self.into_data_async()
+                .await
+                .expect("Failed to fetch data")
+                .as_bytes()
+                .to_vec(),
+            [w as u32, h as u32],
+            color_model,
+            ChannelDatatype::F32,
+        )
+    }
+}
+
+// Assume int images encode u8 data.
+impl BurnToImage for Tensor<3, Int> {
+    async fn into_rerun_image(self) -> rerun::Image {
+        let [h, w, c] = self.dims();
+        let color_model = if c == 3 {
+            ColorModel::RGB
+        } else {
+            ColorModel::RGBA
+        };
+        rerun::Image::from_color_model_and_bytes(
+            self.into_data_async()
+                .await
+                .expect("Failed to fetch data")
+                .as_bytes()
+                .to_vec(),
+            [w as u32, h as u32],
+            color_model,
+            ChannelDatatype::U8,
+        )
+    }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "brush",
+  "version": "1.0.0",
+  "description": "Brush",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev:app",
+    "dev:app": "npm run dev --workspace apps/brush-app/web",
+    "dev:lib": "npm run dev --workspace apps/brush-js/web",
+    "build": "npm run build:app",
+    "build:app": "npm run build --workspace apps/brush-app/web",
+    "build:lib": "npm run build --workspace apps/brush-js/web"
+  },
+  "workspaces": [
+    "apps/brush-app/web",
+    "apps/brush-js/web"
+  ],
+  "devDependencies": {
+    "baseline-browser-mapping": "^2.10.18"
+  }
+}
